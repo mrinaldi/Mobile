@@ -9,10 +9,7 @@ import {
   MoreVertical,
 } from "lucide-react-native";
 import { breadcrumbsFromPath, getBreadcrumbLabel } from "./utils/fileUtils";
-import {
-  getResponsivePadding,
-  getResponsiveFontSize,
-} from "@/app/utils/responsive";
+import { getResponsivePadding } from "@/app/utils/responsive";
 import {
   BORDERS,
   BORDER_COLORS,

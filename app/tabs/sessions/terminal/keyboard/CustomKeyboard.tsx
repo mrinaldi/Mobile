@@ -1,11 +1,11 @@
-import React from "react";
+import React, { useState } from "react";
 import { View, ScrollView, Text } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { TerminalHandle } from "../Terminal";
 import KeyboardKey from "./KeyboardKey";
 import { useKeyboardCustomization } from "@/app/contexts/KeyboardCustomizationContext";
 import { KeyConfig } from "@/types/keyboard";
-import { BORDER_COLORS, SPACING } from "@/app/constants/designTokens";
+import { BACKGROUNDS, BORDER_COLORS, TEXT_COLORS } from "@/app/constants/designTokens";
 
 interface CustomKeyboardProps {
   terminalRef: React.RefObject<TerminalHandle | null>;
@@ -17,10 +17,11 @@ interface CustomKeyboardProps {
 export default function CustomKeyboard({
   terminalRef,
   isVisible,
-  keyboardHeight,
+  keyboardHeight: _keyboardHeight,
   isKeyboardIntentionallyHidden = false,
 }: CustomKeyboardProps) {
   const { config } = useKeyboardCustomization();
+  const [shiftPressed, setShiftPressed] = useState(false);
 
   if (!isVisible) return null;
 
@@ -50,7 +51,13 @@ export default function CustomKeyboard({
       case "tab":
       case "complete":
       case "comp":
-        sendKey("\t");
+        sendKey(shiftPressed ? "\x1b[Z" : "\t");
+        break;
+      case "shiftTab":
+        sendKey("\x1b[Z");
+        break;
+      case "shift":
+        setShiftPressed((current) => !current);
         break;
       case "arrowUp":
       case "history":
@@ -98,7 +105,7 @@ export default function CustomKeyboard({
       if (clipboardContent) {
         sendKey(clipboardContent);
       }
-    } catch (error) {}
+    } catch {}
   };
 
   const { rows } = config.fullKeyboard;
@@ -128,12 +135,10 @@ export default function CustomKeyboard({
     return baseStyle;
   };
 
-  const safeKeyboardHeight = Math.max(200, Math.min(keyboardHeight, 500));
-
   return (
-    <View className="h-full bg-dark-bg-darkest" pointerEvents="box-none">
+    <View style={{ flex: 1, backgroundColor: BACKGROUNDS.DARKEST }} pointerEvents="box-none">
       <ScrollView
-        className="h-full"
+        style={{ flex: 1 }}
         contentContainerStyle={{ paddingHorizontal: 8, paddingVertical: 8 }}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
@@ -142,18 +147,29 @@ export default function CustomKeyboard({
         {visibleRows.map((row, rowIndex) => (
           <View key={row.id}>
             {row.label && (
-              <View className="mb-1 mt-1">
-                <Text className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide">
+              <View style={{ marginBottom: 4, marginTop: 4 }}>
+                <Text
+                  style={{
+                    fontSize: 11,
+                    fontWeight: "600",
+                    textTransform: "uppercase",
+                    letterSpacing: 0.8,
+                    color: TEXT_COLORS.TERTIARY,
+                  }}
+                >
                   {row.label}
                 </Text>
               </View>
             )}
 
             <View
-              className={`flex-row items-center mb-0 ${
-                row.category === "number" ? "flex-nowrap" : "flex-wrap"
-              } ${compactMode ? "-mb-0.5" : ""}`}
-              style={{ gap: getKeyGap() }}
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                flexWrap: row.category === "number" ? "nowrap" : "wrap",
+                gap: getKeyGap(),
+                marginBottom: compactMode ? -2 : 0,
+              }}
             >
               {row.keys.map((key, keyIndex) => (
                 <KeyboardKey
@@ -161,6 +177,8 @@ export default function CustomKeyboard({
                   label={key.label}
                   onPress={() => handleKeyPress(key)}
                   style={getKeyStyle(key)}
+                  isModifier={key.isModifier || key.id === "shift"}
+                  isActive={key.id === "shift" && shiftPressed}
                   keySize={config.settings.keySize}
                   hapticFeedback={config.settings.hapticFeedback}
                 />
@@ -169,8 +187,8 @@ export default function CustomKeyboard({
 
             {rowIndex < visibleRows.length - 1 && (
               <View
-                className="h-px mx-0"
                 style={{
+                  height: 1,
                   backgroundColor: BORDER_COLORS.SEPARATOR,
                   marginVertical: compactMode ? 4 : 8,
                 }}
@@ -180,8 +198,8 @@ export default function CustomKeyboard({
         ))}
 
         {config.settings.showHints && !isKeyboardIntentionallyHidden && (
-          <View className="px-2 pt-2 pb-1 items-center">
-            <Text className="text-[10px] text-gray-600 italic">
+          <View style={{ alignItems: "center", paddingHorizontal: 8, paddingBottom: 4, paddingTop: 8 }}>
+            <Text style={{ fontSize: 10, fontStyle: "italic", color: TEXT_COLORS.TERTIARY }}>
               Customize in Settings
             </Text>
           </View>

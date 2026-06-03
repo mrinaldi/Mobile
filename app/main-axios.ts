@@ -4,14 +4,11 @@ import type {
   SSHHostData,
   TunnelConfig,
   TunnelStatus,
-  Credential,
-  CredentialData,
-  HostInfo,
-  ApiResponse,
   FileManagerFile,
   FileManagerShortcut,
   ServerStatus,
   ServerMetrics,
+  LoginStatsMetrics,
   AuthResponse,
   UserInfo,
   UserCount,
@@ -20,6 +17,10 @@ import type {
   ServerConfig,
   UptimeInfo,
   RecentActivityItem,
+  DockerContainer,
+  DockerContainerStats,
+  DockerContainerAction as DockerActionType,
+  SessionAuthOverrides,
 } from "../types/index";
 import {
   apiLogger,
@@ -64,7 +65,11 @@ export async function setCookie(
 ): Promise<void> {
   try {
     await AsyncStorage.setItem(name, value);
-  } catch (error) {}
+  } catch (error) {
+    systemLogger.error(`[setCookie] Failed to persist ${name} to AsyncStorage`, error, {
+      operation: "set_cookie",
+    });
+  }
 }
 
 export async function getCookie(name: string): Promise<string | undefined> {
@@ -72,10 +77,9 @@ export async function getCookie(name: string): Promise<string | undefined> {
     const token = await AsyncStorage.getItem(name);
     return token || undefined;
   } catch (error) {
-    console.error(
-      `[getCookie] Error reading ${name} from AsyncStorage:`,
-      error,
-    );
+    systemLogger.error(`[getCookie] Failed to read ${name} from AsyncStorage`, error, {
+      operation: "get_cookie",
+    });
     return undefined;
   }
 }
@@ -221,6 +225,13 @@ function createApiInstance(
         } else {
           logger.networkError(method, fullUrl, message, context);
         }
+      } else if (
+        status === 404 &&
+        serviceName === "STATS" &&
+        url.includes("/metrics/")
+      ) {
+        // 404 on metrics means data isn't ready yet — suppress as debug noise.
+        logger.debug(`Metrics not yet available: ${method} ${url}`, context);
       } else {
         logger.requestError(
           method,
@@ -276,15 +287,51 @@ export async function initializeServerConfig(): Promise<void> {
         configuredServerUrl = config.serverUrl;
         updateApiInstances();
         await detectAndUpdateApiInstances();
-      } else {
       }
-    } else {
     }
-  } catch (error) {}
+  } catch (error) {
+    systemLogger.error("[initializeServerConfig] Failed to load server config", error, {
+      operation: "initialize_server_config",
+    });
+  }
 }
 
 export function getCurrentServerUrl(): string | null {
   return configuredServerUrl;
+}
+
+/**
+ * WebSocket URL for the Docker exec console (backend WS server on port 30009).
+ * Token is passed as a query param (the WS server accepts cookie / Bearer /
+ * `?token=`). The console speaks JSON messages: connect/input/resize/disconnect.
+ */
+export function getDockerConsoleWebSocketUrl(token: string): string {
+  const base = getRootBase(30009).replace(/\/$/, "");
+  const websocketBase = base.replace(/^http/i, (scheme) =>
+    scheme.toLowerCase() === "https" ? "wss" : "ws",
+  );
+  const params = new URLSearchParams({ token });
+  // When a real server URL is configured, nginx routes /docker/console/ → port 30009.
+  // In local dev (no configuredServerUrl), getRootBase already includes :30009.
+  const path = configuredServerUrl ? "/docker/console/" : "/";
+  return `${websocketBase}${path}?${params.toString()}`;
+}
+
+export function getGuacamoleWebSocketUrl(
+  token: string,
+  width?: number,
+  height?: number,
+): string {
+  const base = getRootBase(8081).replace(/\/$/, "");
+  const websocketBase = base.replace(/^http/i, (scheme) =>
+    scheme.toLowerCase() === "https" ? "wss" : "ws",
+  );
+  const params = new URLSearchParams({ token });
+
+  if (width) params.set("width", String(width));
+  if (height) params.set("height", String(height));
+
+  return `${websocketBase}/guacamole/websocket/?${params.toString()}`;
 }
 
 export async function isAuthenticated(): Promise<boolean> {
@@ -299,7 +346,11 @@ export async function isAuthenticated(): Promise<boolean> {
 export async function clearAuth(): Promise<void> {
   try {
     await AsyncStorage.removeItem("jwt");
-  } catch (error) {}
+  } catch (error) {
+    systemLogger.error("[clearAuth] Failed to remove jwt from AsyncStorage", error, {
+      operation: "clear_auth",
+    });
+  }
 }
 
 export async function clearServerConfig(): Promise<void> {
@@ -315,6 +366,40 @@ export async function clearServerConfig(): Promise<void> {
       operation: "clear_server_config",
     });
   }
+}
+
+// Behind a reverse-proxy auth gate (e.g. Pangolin) the sign-in WebView keeps the
+// proxy's session cookie, so the next sign-in would skip the proxy login. We
+// reset it with pure JS (no native cookie module / no rebuild): flag that the
+// next sign-in WebView must use an ephemeral (incognito) cookie store, which
+// starts with no proxy cookie and therefore shows the proxy login again.
+const FRESH_WEBVIEW_SESSION_KEY = "freshWebViewSession";
+
+export async function requestFreshWebSession(): Promise<void> {
+  try {
+    await AsyncStorage.setItem(FRESH_WEBVIEW_SESSION_KEY, "1");
+  } catch {
+    // Non-fatal: worst case the WebView reuses the previous proxy session.
+  }
+}
+
+export async function consumeFreshWebSession(): Promise<boolean> {
+  try {
+    const v = await AsyncStorage.getItem(FRESH_WEBVIEW_SESSION_KEY);
+    if (v) {
+      await AsyncStorage.removeItem(FRESH_WEBVIEW_SESSION_KEY);
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+/** Full session reset: JWT + force a fresh (incognito) proxy login next time. */
+export async function clearSession(): Promise<void> {
+  await AsyncStorage.removeItem("jwt");
+  await requestFreshWebSession();
 }
 
 function getApiUrl(path: string, defaultPort: number): string {
@@ -388,7 +473,11 @@ async function detectAndUpdateApiInstances(): Promise<void> {
       (async () => {
         try {
           const base = getRootBase(8085).replace(/\/$/, "");
-          const testInstance = axios.create({ baseURL: base, timeout: 5000, headers: authHeaders });
+          const testInstance = axios.create({
+            baseURL: base,
+            timeout: 5000,
+            headers: authHeaders,
+          });
           await testInstance.head("/status");
           return true;
         } catch {
@@ -398,7 +487,11 @@ async function detectAndUpdateApiInstances(): Promise<void> {
       (async () => {
         try {
           const base = getSshBase(8085).replace(/\/$/, "");
-          const testInstance = axios.create({ baseURL: base, timeout: 5000, headers: authHeaders });
+          const testInstance = axios.create({
+            baseURL: base,
+            timeout: 5000,
+            headers: authHeaders,
+          });
           await testInstance.head("/status");
           return true;
         } catch {
@@ -408,7 +501,11 @@ async function detectAndUpdateApiInstances(): Promise<void> {
       (async () => {
         try {
           const base = getRootBase(8081).replace(/\/$/, "");
-          const testInstance = axios.create({ baseURL: base, timeout: 5000, headers: authHeaders });
+          const testInstance = axios.create({
+            baseURL: base,
+            timeout: 5000,
+            headers: authHeaders,
+          });
           await testInstance.head("/users/registration-allowed");
           return true;
         } catch {
@@ -418,7 +515,11 @@ async function detectAndUpdateApiInstances(): Promise<void> {
       (async () => {
         try {
           const base = getSshBase(8081).replace(/\/$/, "");
-          const testInstance = axios.create({ baseURL: base, timeout: 5000, headers: authHeaders });
+          const testInstance = axios.create({
+            baseURL: base,
+            timeout: 5000,
+            headers: authHeaders,
+          });
           await testInstance.head("/users/registration-allowed");
           return true;
         } catch {
@@ -480,6 +581,22 @@ class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/**
+ * Pulls a `connectionLogs` array off a connect response (or an axios error's
+ * response body). Session connect endpoints return these on both success and
+ * failure so the UI can surface a connection log. Returns [] when absent.
+ */
+export function extractConnectionLogs(
+  source: unknown,
+): { type: string; stage?: string; message: string }[] {
+  const data =
+    axios.isAxiosError(source)
+      ? (source.response?.data as any)
+      : (source as any);
+  const logs = data?.connectionLogs;
+  return Array.isArray(logs) ? logs : [];
 }
 
 function handleApiError(error: unknown, operation: string): never {
@@ -642,10 +759,41 @@ function handleApiError(error: unknown, operation: string): never {
 // SSH HOST MANAGEMENT
 // ============================================================================
 
+function normalizeJumpHosts(value: unknown): { hostId: number }[] {
+  const raw =
+    typeof value === "string"
+      ? (() => {
+          try {
+            return JSON.parse(value);
+          } catch {
+            return [];
+          }
+        })()
+      : value;
+
+  if (!Array.isArray(raw)) return [];
+
+  return raw
+    .map((item) => {
+      const hostId = Number((item as { hostId?: unknown })?.hostId);
+      return Number.isFinite(hostId) ? { hostId } : null;
+    })
+    .filter((item): item is { hostId: number } => item !== null);
+}
+
+function normalizeSSHHost(host: SSHHost): SSHHost {
+  return {
+    ...host,
+    jumpHosts: normalizeJumpHosts((host as { jumpHosts?: unknown }).jumpHosts),
+  };
+}
+
 export async function getSSHHosts(): Promise<SSHHost[]> {
   try {
     const response = await sshHostApi.get("/db/host");
-    return response.data;
+    return Array.isArray(response.data)
+      ? response.data.map(normalizeSSHHost)
+      : response.data;
   } catch (error) {
     handleApiError(error, "fetch SSH hosts");
   }
@@ -683,6 +831,7 @@ export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
         : null,
       terminalConfig: hostData.terminalConfig || null,
       forceKeyboardInteractive: Boolean(hostData.forceKeyboardInteractive),
+      ...buildProtocolFields(hostData),
     };
 
     if (!submitData.enableTunnel) {
@@ -712,6 +861,39 @@ export async function createSSHHost(hostData: SSHHostData): Promise<SSHHost> {
   } catch (error) {
     handleApiError(error, "create SSH host");
   }
+}
+
+/**
+ * Modern multi-protocol fields shared by create/update. Only included when the
+ * caller provides them so legacy SSH-only payloads are unchanged. SSH defaults
+ * to enabled when no protocol flags are specified.
+ */
+function buildProtocolFields(hostData: SSHHostData): Record<string, unknown> {
+  const anyProtocol =
+    hostData.enableSsh !== undefined ||
+    hostData.enableRdp ||
+    hostData.enableVnc ||
+    hostData.enableTelnet;
+  return {
+    enableSsh: anyProtocol ? Boolean(hostData.enableSsh) : true,
+    enableRdp: Boolean(hostData.enableRdp),
+    enableVnc: Boolean(hostData.enableVnc),
+    enableTelnet: Boolean(hostData.enableTelnet),
+    enableDocker: Boolean(hostData.enableDocker),
+    notes: hostData.notes ?? "",
+    rdpUser: hostData.enableRdp ? (hostData.rdpUser ?? null) : null,
+    rdpPassword: hostData.enableRdp ? (hostData.rdpPassword ?? null) : null,
+    rdpDomain: hostData.enableRdp ? (hostData.rdpDomain ?? null) : null,
+    rdpPort: hostData.enableRdp ? (hostData.rdpPort ?? null) : null,
+    vncUser: hostData.enableVnc ? (hostData.vncUser ?? null) : null,
+    vncPassword: hostData.enableVnc ? (hostData.vncPassword ?? null) : null,
+    vncPort: hostData.enableVnc ? (hostData.vncPort ?? null) : null,
+    telnetUser: hostData.enableTelnet ? (hostData.telnetUser ?? null) : null,
+    telnetPassword: hostData.enableTelnet
+      ? (hostData.telnetPassword ?? null)
+      : null,
+    telnetPort: hostData.enableTelnet ? (hostData.telnetPort ?? null) : null,
+  };
 }
 
 export async function updateSSHHost(
@@ -749,6 +931,7 @@ export async function updateSSHHost(
         : null,
       terminalConfig: hostData.terminalConfig || null,
       forceKeyboardInteractive: Boolean(hostData.forceKeyboardInteractive),
+      ...buildProtocolFields(hostData),
     };
 
     if (!submitData.enableTunnel) {
@@ -819,6 +1002,17 @@ export async function exportSSHHostWithCredentials(
     return response.data;
   } catch (error) {
     handleApiError(error, "export SSH host with credentials");
+  }
+}
+
+export async function getGuacamoleTokenFromHost(
+  hostId: number,
+): Promise<{ token: string }> {
+  try {
+    const response = await authApi.post(`/guacamole/connect-host/${hostId}`);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "connect Guacamole host");
   }
 }
 
@@ -1060,6 +1254,23 @@ export async function connectSSH(
     return response.data;
   } catch (error) {
     handleApiError(error, "connect SSH");
+  }
+}
+
+export async function verifySSHWarpgate(
+  sessionId: string,
+  warpgateUrl: string,
+  securityKey?: string,
+): Promise<any> {
+  try {
+    const response = await fileManagerApi.post("/ssh/connect-warpgate", {
+      sessionId,
+      warpgateUrl,
+      securityKey,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "verify SSH Warpgate");
   }
 }
 
@@ -1518,6 +1729,108 @@ export async function compressSSHFiles(
   }
 }
 
+export async function resolveSSHPath(
+  sessionId: string,
+  path: string,
+): Promise<{ resolved: string }> {
+  try {
+    const response = await fileManagerApi.get("/ssh/resolvePath", {
+      params: { sessionId, path },
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "resolve SSH path");
+  }
+}
+
+export async function executeSSHFile(
+  sessionId: string,
+  path: string,
+  hostId?: number,
+  userId?: string,
+): Promise<any> {
+  try {
+    const response = await fileManagerApi.post("/ssh/executeFile", {
+      sessionId,
+      path,
+      hostId,
+      userId,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "execute SSH file");
+  }
+}
+
+/**
+ * Store a sudo password for a session so the backend can satisfy sudo prompts
+ * during file operations (mirrors the web file-manager sudo flow).
+ */
+export async function setSSHSudoPassword(
+  sessionId: string,
+  password: string,
+): Promise<any> {
+  try {
+    const response = await fileManagerApi.post("/sudo-password", {
+      sessionId,
+      password,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "set sudo password");
+  }
+}
+
+// ============================================================================
+// TERMINAL COMMAND HISTORY
+// ============================================================================
+
+/** Per-host shell command history (deduped, newest first, max 500). */
+export async function getCommandHistory(hostId: number): Promise<string[]> {
+  try {
+    const response = await authApi.get(`/terminal/command_history/${hostId}`);
+    const data = response.data;
+    if (Array.isArray(data)) {
+      return data
+        .map((row: any) => (typeof row === "string" ? row : row?.command))
+        .filter((c: unknown): c is string => typeof c === "string");
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+export async function saveCommandToHistory(
+  hostId: number,
+  command: string,
+): Promise<void> {
+  try {
+    await authApi.post("/terminal/command_history", { hostId, command });
+  } catch {
+    // History is best-effort; never block the terminal on it.
+  }
+}
+
+export async function deleteCommandFromHistory(
+  hostId: number,
+  command: string,
+): Promise<void> {
+  try {
+    await authApi.post("/terminal/command_history/delete", { hostId, command });
+  } catch {
+    // Best-effort.
+  }
+}
+
+export async function clearCommandHistory(hostId: number): Promise<void> {
+  try {
+    await authApi.delete(`/terminal/command_history/${hostId}`);
+  } catch {
+    // Best-effort.
+  }
+}
+
 // ============================================================================
 // FILE MANAGER DATA
 // ============================================================================
@@ -1705,24 +2018,130 @@ export async function getServerStatusById(id: number): Promise<ServerStatus> {
   }
 }
 
-export async function getServerMetricsById(id: number): Promise<ServerMetrics> {
+function normalizeMetrics(raw: any): ServerMetrics {
+  // Processes: coerce cpu/mem strings → numbers (backend sends "2.5" not 2.5)
+  let processes = raw.processes;
+  if (processes?.top) {
+    processes = {
+      ...processes,
+      top: processes.top.map((p: any) => ({
+        ...p,
+        cpu: Number(p.cpu) || 0,
+        mem: Number(p.mem) || 0,
+      })),
+    };
+  }
+
+  // Network: map rxBytes/txBytes → rx/tx
+  let network = raw.network;
+  if (network?.interfaces) {
+    network = {
+      ...network,
+      interfaces: network.interfaces.map((iface: any) => ({
+        ...iface,
+        rx: iface.rx ?? iface.rxBytes ?? null,
+        tx: iface.tx ?? iface.txBytes ?? null,
+      })),
+    };
+  }
+
+  // Login stats: snake_case backend key → camelCase, map to correct shape
+  const rawLogin = raw.login_stats ?? raw.loginStats;
+  const loginStats: LoginStatsMetrics | undefined = rawLogin
+    ? {
+        recentLogins: Array.isArray(rawLogin.recentLogins) ? rawLogin.recentLogins : [],
+        failedLogins: Array.isArray(rawLogin.failedLogins) ? rawLogin.failedLogins : [],
+        totalLogins: rawLogin.totalLogins ?? 0,
+        uniqueIPs: rawLogin.uniqueIPs ?? 0,
+      }
+    : undefined;
+
+  return { ...raw, processes, network, loginStats } as ServerMetrics;
+}
+
+export async function getServerMetricsById(id: number): Promise<ServerMetrics | null> {
   try {
     const response = await statsApi.get(`/metrics/${id}`);
-    return response.data;
+    return response.data ? normalizeMetrics(response.data) : null;
   } catch (error: any) {
     if (error?.response?.status === 404) {
-      try {
-        const alt = axios.create({
-          baseURL: getRootBase(8085),
-          headers: { "Content-Type": "application/json" },
-        });
-        const response = await alt.get(`/metrics/${id}`);
-        return response.data;
-      } catch (e) {
-        handleApiError(e, "fetch server metrics");
-      }
+      // Metrics not ready yet — backend is still starting collection.
+      return null;
     }
     handleApiError(error, "fetch server metrics");
+  }
+}
+
+/**
+ * Start metrics collection for a host. Returns a viewerSessionId that must be
+ * passed to heartbeat/stop/unregister calls. May return requiresTOTP for 2FA hosts.
+ */
+export async function startMetricsPolling(id: number): Promise<{
+  success?: boolean;
+  requiresTOTP?: boolean;
+  sessionId?: string;
+  viewerSessionId?: string;
+}> {
+  try {
+    const response = await statsApi.post(`/metrics/start/${id}`);
+    return response.data || {};
+  } catch (error) {
+    handleApiError(error, "start metrics polling");
+  }
+}
+
+export async function stopMetricsPolling(id: number, viewerSessionId?: string): Promise<void> {
+  try {
+    await statsApi.post(`/metrics/stop/${id}`, viewerSessionId ? { viewerSessionId } : undefined);
+  } catch {
+    // Best-effort on teardown.
+  }
+}
+
+export async function submitMetricsTOTP(
+  sessionId: string,
+  totpCode: string,
+): Promise<any> {
+  try {
+    const response = await statsApi.post("/metrics/connect-totp", {
+      sessionId,
+      totpCode,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "submit metrics TOTP");
+  }
+}
+
+/** Register this viewer so the backend keeps polling while the screen is open. Returns a viewerSessionId. */
+export async function registerMetricsViewer(id: number): Promise<{
+  success?: boolean;
+  viewerSessionId?: string;
+  skipped?: boolean;
+}> {
+  try {
+    const response = await statsApi.post("/metrics/register-viewer", { hostId: id });
+    return response.data || {};
+  } catch {
+    // Best-effort.
+    return {};
+  }
+}
+
+export async function unregisterMetricsViewer(id: number, viewerSessionId: string): Promise<void> {
+  try {
+    await statsApi.post("/metrics/unregister-viewer", { hostId: id, viewerSessionId });
+  } catch {
+    // Best-effort on teardown.
+  }
+}
+
+/** Heartbeat so the backend knows a viewer is still watching this host. */
+export async function sendMetricsHeartbeat(viewerSessionId: string): Promise<void> {
+  try {
+    await statsApi.post("/metrics/heartbeat", { viewerSessionId });
+  } catch {
+    // Best-effort.
   }
 }
 
@@ -1730,7 +2149,7 @@ export async function refreshServerPolling(): Promise<void> {
   try {
     await statsApi.post("/refresh");
   } catch (error) {
-    console.warn("Failed to refresh server polling:", error);
+    statsLogger.warn("Failed to refresh server polling", { operation: "refresh_polling" });
   }
 }
 
@@ -1740,7 +2159,7 @@ export async function notifyHostCreatedOrUpdated(
   try {
     await statsApi.post("/host-updated", { hostId });
   } catch (error) {
-    console.warn("Failed to notify stats server of host update:", error);
+    statsLogger.warn("Failed to notify stats server of host update", { operation: "notify_host_updated" });
   }
 }
 
@@ -1791,6 +2210,62 @@ function extractJwtFromSetCookie(headers: any): string | null {
   return null;
 }
 
+/**
+ * Detects whether the server URL sits behind a reverse-proxy authentication
+ * gate (Cloudflare Access, Authelia, etc.) that intercepts requests and serves
+ * its own HTML login page instead of forwarding them to Termix. In that case a
+ * native login form cannot work — the user must authenticate to the proxy in a
+ * browser context (the WebView/SSO flow).
+ *
+ * Returns true when a known JSON endpoint responds with HTML (or otherwise
+ * non-JSON) content, which is the tell-tale sign of an interposing auth proxy.
+ */
+export async function isReverseProxyAuthGate(): Promise<boolean> {
+  const probe = async (base: string): Promise<boolean | null> => {
+    try {
+      const url = `${base.replace(/\/$/, "")}/users/registration-allowed`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "GET",
+          signal: controller.signal,
+          headers: {
+            Accept: "application/json",
+            "User-Agent": `Termix-Mobile/${Platform.OS === "android" ? "Android" : "iOS"}`,
+          },
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      const body = await res.text();
+      // A genuine Termix API endpoint returns JSON. An auth proxy returns its
+      // login HTML (often with a 200 or a redirect-resolved 200).
+      if (contentType.includes("application/json")) return false;
+      const looksHtml =
+        contentType.includes("text/html") ||
+        /^\s*<(?:!doctype|html)/i.test(body);
+      if (looksHtml) return true;
+      // Unknown content-type but valid JSON body → treat as real API.
+      try {
+        JSON.parse(body);
+        return false;
+      } catch {
+        return looksHtml ? true : null;
+      }
+    } catch {
+      return null;
+    }
+  };
+
+  const rootResult = await probe(getRootBase(8081));
+  if (rootResult !== null) return rootResult;
+  const sshResult = await probe(getSshBase(8081));
+  return sshResult === true;
+}
+
 async function loginWithFetch(
   baseUrl: string,
   username: string,
@@ -1803,14 +2278,39 @@ async function loginWithFetch(
     body: JSON.stringify({ username, password }),
   });
 
+  const contentType = (
+    fetchResponse.headers.get("content-type") || ""
+  ).toLowerCase();
+  const rawBody = await fetchResponse.text();
+
+  // A reverse-proxy auth gate intercepts the request and returns its HTML login
+  // page instead of Termix JSON. Surface a clear, actionable error rather than
+  // crashing on JSON.parse of "<!DOCTYPE html>…".
+  const looksHtml =
+    contentType.includes("text/html") ||
+    /^\s*<(?:!doctype|html)/i.test(rawBody);
+  if (looksHtml) {
+    const err: any = new Error(
+      "This server is behind a login proxy. Use the external sign-in option instead.",
+    );
+    err.code = "PROXY_AUTH_GATE";
+    err.response = { status: fetchResponse.status, data: {} };
+    throw err;
+  }
+
   if (!fetchResponse.ok) {
-    const errData = await fetchResponse.json().catch(() => ({}));
+    let errData: any = {};
+    try {
+      errData = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+      errData = {};
+    }
     const err: any = new Error(errData?.error || "Login failed");
     err.response = { status: fetchResponse.status, data: errData };
     throw err;
   }
 
-  const data = await fetchResponse.json();
+  const data = JSON.parse(rawBody);
 
   let token: string | null = data.token || null;
   const setCookie = fetchResponse.headers.get("set-cookie");
@@ -1834,12 +2334,17 @@ export async function loginUser(
       return { ...data, token: data.temp_token || "" };
     }
 
-
     let finalToken = token;
     if (!finalToken) {
       try {
-        const axiosResponse = await authApi.post("/users/login", { username, password });
-        finalToken = extractJwtFromSetCookie(axiosResponse.headers) || axiosResponse.data.token || null;
+        const axiosResponse = await authApi.post("/users/login", {
+          username,
+          password,
+        });
+        finalToken =
+          extractJwtFromSetCookie(axiosResponse.headers) ||
+          axiosResponse.data.token ||
+          null;
       } catch {
         // ignore, we already have data
       }
@@ -1851,10 +2356,17 @@ export async function loginUser(
 
     return { ...data, token: finalToken || "" };
   } catch (error: any) {
+    if (error?.code === "PROXY_AUTH_GATE") {
+      throw new ApiError(error.message, 0, "PROXY_AUTH_GATE");
+    }
     if (error?.response?.status === 404) {
       try {
         const altBase = getSshBase(8081);
-        const { data, token } = await loginWithFetch(altBase, username, password);
+        const { data, token } = await loginWithFetch(
+          altBase,
+          username,
+          password,
+        );
 
         if (data.requires_totp) {
           return { ...data, token: data.temp_token || "" };
@@ -1865,7 +2377,10 @@ export async function loginUser(
         }
 
         return { ...data, token: token || "" };
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.code === "PROXY_AUTH_GATE") {
+          throw new ApiError(e.message, 0, "PROXY_AUTH_GATE");
+        }
         handleApiError(e, "login user");
       }
     }
@@ -1952,10 +2467,10 @@ export async function getOIDCConfig(): Promise<any> {
     const response = await authApi.get("/users/oidc-config");
     return response.data;
   } catch (error: any) {
-    console.warn(
-      "Failed to fetch OIDC config:",
-      error.response?.data?.error || error.message,
-    );
+    authLogger.warn("Failed to fetch OIDC config", {
+      operation: "get_oidc_config",
+      error: error.response?.data?.error || error.message,
+    });
     return null;
   }
 }
@@ -2028,24 +2543,13 @@ export async function completePasswordReset(
   }
 }
 
-export async function changePassword(
-  oldPassword: string,
-  newPassword: string,
-): Promise<any> {
+export async function getOIDCAuthorizeUrl(
+  appCallbackUrl?: string,
+): Promise<OIDCAuthorize> {
   try {
-    const response = await authApi.post("/users/change-password", {
-      oldPassword,
-      newPassword,
+    const response = await authApi.get("/users/oidc/authorize", {
+      params: appCallbackUrl ? { appCallbackUrl } : undefined,
     });
-    return response.data;
-  } catch (error) {
-    handleApiError(error, "change password");
-  }
-}
-
-export async function getOIDCAuthorizeUrl(): Promise<OIDCAuthorize> {
-  try {
-    const response = await authApi.get("/users/oidc/authorize");
     return response.data;
   } catch (error) {
     handleApiError(error, "get OIDC authorize URL");
@@ -2497,7 +3001,7 @@ export async function getSSHHostWithCredentials(hostId: number): Promise<any> {
     const response = await sshHostApi.get(
       `/db/host/${hostId}/with-credentials`,
     );
-    return response.data;
+    return response.data ? normalizeSSHHost(response.data) : response.data;
   } catch (error) {
     handleApiError(error, "fetch SSH host with credentials");
   }
@@ -2589,9 +3093,15 @@ export function connectToTerminalHost(
         hostConfig,
       },
     };
-
     ws.send(JSON.stringify(connectMessage));
   } else {
+    sshLogger.warn(
+      "[connectToTerminalHost] WebSocket is not open — connect message dropped",
+      {
+        operation: "connect_to_host",
+        readyState: ws.readyState,
+      },
+    );
   }
 }
 
@@ -3100,5 +3610,350 @@ export async function unlinkOIDCFromPasswordAccount(
   } catch (error) {
     handleApiError(error, "unlink OIDC from password account");
     throw error;
+  }
+}
+
+// ============================================================================
+// OPEN TABS / CROSS-DEVICE SESSIONS
+// Persists open tabs per user so connections can be revived and switched
+// between devices (open on desktop, continue on mobile). Mirrors the web app.
+// ============================================================================
+
+export interface OpenTabRecord {
+  id: string;
+  userId: string;
+  tabType: string;
+  hostId: number | null;
+  label: string;
+  tabOrder: number;
+  backendSessionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OpenTabUpsertPayload {
+  id: string;
+  tabType: string;
+  hostId?: number | null;
+  label: string;
+  tabOrder: number;
+  backendSessionId?: string | null;
+}
+
+export interface ActiveSessionInfo {
+  sessionId: string;
+  hostId: number;
+  hostName: string;
+  tabInstanceId: string | null;
+  isConnected: boolean;
+  createdAt: number;
+}
+
+export async function getOpenTabs(): Promise<OpenTabRecord[]> {
+  try {
+    const response = await authApi.get("/open-tabs");
+    return Array.isArray(response.data) ? response.data : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function addOpenTab(tab: OpenTabUpsertPayload): Promise<void> {
+  try {
+    await authApi.post("/open-tabs", tab);
+  } catch {
+    // best-effort; cross-device sync is non-critical to local use
+  }
+}
+
+export async function patchOpenTab(
+  instanceId: string,
+  updates: Partial<
+    Pick<OpenTabRecord, "label" | "tabOrder" | "backendSessionId">
+  >,
+): Promise<void> {
+  try {
+    await authApi.patch(`/open-tabs/${instanceId}`, updates);
+  } catch {
+    // best-effort
+  }
+}
+
+export async function deleteOpenTab(instanceId: string): Promise<void> {
+  try {
+    await authApi.delete(`/open-tabs/${instanceId}`);
+  } catch {
+    // best-effort
+  }
+}
+
+export async function getActiveSessions(): Promise<ActiveSessionInfo[]> {
+  try {
+    const response = await authApi.get("/open-tabs/active-sessions");
+    return Array.isArray(response.data) ? response.data : [];
+  } catch {
+    return [];
+  }
+}
+
+// ============================================================================
+// DOCKER — session-based container management over SSH.
+//
+// IMPORTANT: Docker uses the SAME session-based REST contract as the file
+// manager (connect → sessionId → keepalive/status/disconnect → operations),
+// served by the SSH/file-manager backend service (`fileManagerApi` base, paths
+// under `/docker/...`). The previous mobile implementation called
+// `sshHostApi /:hostId/docker/...` endpoints that DO NOT EXIST on the backend,
+// so Docker never actually worked — this is the corrected wiring.
+//
+// Guacamole helpers (getGuacamoleWebSocketUrl/getGuacamoleTokenFromHost) live
+// earlier in this file.
+// ============================================================================
+
+export type {
+  DockerContainer,
+  DockerContainerStats,
+} from "../types/index";
+
+/**
+ * Docker REST API base. nginx routes /docker/* → port 30007 from the server
+ * root (no /ssh prefix). In local dev without a configured server URL,
+ * getRootBase falls back to localhost:30007.
+ */
+function getDockerBase(): string {
+  return getRootBase(30007).replace(/\/$/, "");
+}
+
+function dockerApi(): AxiosInstance {
+  return createApiInstance(getDockerBase(), "DOCKER");
+}
+
+/** Establish (or reuse) an SSH session for Docker operations on a host. */
+export async function dockerConnect(
+  sessionId: string,
+  hostId: number,
+  overrides?: SessionAuthOverrides,
+): Promise<any> {
+  try {
+    const response = await dockerApi().post("/docker/ssh/connect", {
+      sessionId,
+      hostId,
+      userProvidedPassword: overrides?.userProvidedPassword,
+      userProvidedSshKey: overrides?.userProvidedSshKey,
+      userProvidedKeyPassword: overrides?.userProvidedKeyPassword,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "connect Docker session");
+  }
+}
+
+export async function dockerConnectTOTP(
+  sessionId: string,
+  totpCode: string,
+): Promise<any> {
+  try {
+    const response = await dockerApi().post("/docker/ssh/connect-totp", {
+      sessionId,
+      totpCode,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "submit Docker TOTP");
+  }
+}
+
+export async function dockerKeepAlive(sessionId: string): Promise<void> {
+  try {
+    await dockerApi().post("/docker/ssh/keepalive", { sessionId });
+  } catch {
+    // Best-effort heartbeat.
+  }
+}
+
+export async function dockerDisconnect(sessionId: string): Promise<void> {
+  try {
+    await dockerApi().post("/docker/ssh/disconnect", { sessionId });
+  } catch {
+    // Best-effort on teardown.
+  }
+}
+
+export async function dockerStatus(
+  sessionId: string,
+): Promise<{ connected: boolean }> {
+  try {
+    const response = await dockerApi().get("/docker/ssh/status", {
+      params: { sessionId },
+    });
+    return response.data || { connected: false };
+  } catch {
+    return { connected: false };
+  }
+}
+
+/** Whether Docker is actually available on the connected host. */
+export async function dockerValidate(
+  sessionId: string,
+): Promise<{ available: boolean; version?: string; error?: string }> {
+  try {
+    const response = await dockerApi().get(`/docker/validate/${sessionId}`);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "validate Docker");
+  }
+}
+
+export async function getDockerContainers(
+  sessionId: string,
+  all = true,
+): Promise<DockerContainer[]> {
+  try {
+    const response = await dockerApi().get(
+      `/docker/containers/${sessionId}`,
+      { params: { all } },
+    );
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.containers ?? []);
+  } catch (error) {
+    handleApiError(error, "list Docker containers");
+  }
+}
+
+export async function getDockerContainerDetail(
+  sessionId: string,
+  containerId: string,
+): Promise<any> {
+  try {
+    const response = await dockerApi().get(
+      `/docker/containers/${sessionId}/${containerId}`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "inspect Docker container");
+  }
+}
+
+export async function getDockerContainerStats(
+  sessionId: string,
+  containerId: string,
+): Promise<DockerContainerStats> {
+  try {
+    const response = await dockerApi().get(
+      `/docker/containers/${sessionId}/${containerId}/stats`,
+    );
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch Docker stats");
+  }
+}
+
+export async function dockerContainerAction(
+  sessionId: string,
+  containerId: string,
+  action: DockerActionType,
+): Promise<void> {
+  try {
+    if (action === "remove") {
+      await dockerApi().delete(
+        `/docker/containers/${sessionId}/${containerId}`,
+      );
+    } else {
+      await dockerApi().post(
+        `/docker/containers/${sessionId}/${containerId}/${action}`,
+      );
+    }
+  } catch (error) {
+    handleApiError(error, `docker ${action}`);
+  }
+}
+
+export async function getDockerContainerLogs(
+  sessionId: string,
+  containerId: string,
+  tail = 200,
+): Promise<string> {
+  try {
+    const response = await dockerApi().get(
+      `/docker/containers/${sessionId}/${containerId}/logs`,
+      { params: { tail } },
+    );
+    const data = response.data;
+    if (typeof data === "string") return data;
+    return data?.logs ?? "";
+  } catch (error) {
+    handleApiError(error, "fetch Docker logs");
+  }
+}
+
+// ============================================================================
+// WAKE-ON-LAN
+// ============================================================================
+
+export async function wakeHost(hostId: number): Promise<{ success: boolean; message: string }> {
+  try {
+    const response = await sshHostApi.post(`/db/host/${hostId}/wake`);
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "wake host");
+  }
+}
+
+// ============================================================================
+// API KEY MANAGEMENT
+// ============================================================================
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+}
+
+export async function getApiKeys(): Promise<{ apiKeys: ApiKey[] }> {
+  try {
+    const response = await authApi.get("/users/api-keys");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch API keys");
+  }
+}
+
+export async function createApiKey(
+  name: string,
+  userId: string,
+  expiresAt?: string,
+): Promise<{ apiKey: ApiKey & { key: string; token: string } }> {
+  try {
+    const response = await authApi.post("/users/api-keys", {
+      name,
+      userId,
+      expiresAt: expiresAt ?? null,
+    });
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "create API key");
+  }
+}
+
+export async function deleteApiKey(keyId: string): Promise<void> {
+  try {
+    await authApi.delete(`/users/api-keys/${keyId}`);
+  } catch (error) {
+    handleApiError(error, "delete API key");
+  }
+}
+
+// ============================================================================
+// TOTP BACKUP CODES
+// ============================================================================
+
+export async function getTOTPBackupCodes(): Promise<{ backup_codes: string[] }> {
+  try {
+    const response = await authApi.get("/users/totp/backup-codes");
+    return response.data;
+  } catch (error) {
+    handleApiError(error, "fetch TOTP backup codes");
   }
 }

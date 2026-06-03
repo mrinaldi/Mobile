@@ -6,6 +6,7 @@ import {
   ScrollView,
   TextInput,
   Keyboard,
+  StyleSheet,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
@@ -15,18 +16,46 @@ import {
   Minus,
   ChevronDown,
   ChevronUp,
+  SquareTerminal,
+  Activity,
+  Folder,
+  Network,
+  Container,
+  Monitor,
+  Layers,
 } from "lucide-react-native";
-import { TerminalSession } from "@/app/contexts/TerminalSessionsContext";
+import {
+  SessionType,
+  TerminalSession,
+} from "@/app/contexts/TerminalSessionsContext";
 import { useRouter } from "expo-router";
 import { useKeyboard } from "@/app/contexts/KeyboardContext";
 import { useOrientation } from "@/app/utils/orientation";
 import { getTabBarHeight, getButtonSize } from "@/app/utils/responsive";
 import {
-  BORDERS,
   BORDER_COLORS,
   BACKGROUNDS,
   RADIUS,
+  ACCENT,
+  TEXT_COLORS,
 } from "@/app/constants/designTokens";
+
+function getSessionIcon(type: SessionType) {
+  switch (type) {
+    case "terminal":
+      return SquareTerminal;
+    case "stats":
+      return Activity;
+    case "filemanager":
+      return Folder;
+    case "tunnel":
+      return Network;
+    case "docker":
+      return Container;
+    case "remoteDesktop":
+      return Monitor;
+  }
+}
 
 interface TabBarProps {
   sessions: TerminalSession[];
@@ -40,7 +69,9 @@ interface TabBarProps {
   onHideKeyboard?: () => void;
   onShowKeyboard?: () => void;
   keyboardIntentionallyHiddenRef: React.MutableRefObject<boolean>;
-  activeSessionType?: "terminal" | "stats" | "filemanager";
+  activeSessionType?: SessionType;
+  onShowConnections?: () => void;
+  hasBackgroundSessions?: boolean;
 }
 
 export default function TabBar({
@@ -56,6 +87,8 @@ export default function TabBar({
   onShowKeyboard,
   keyboardIntentionallyHiddenRef,
   activeSessionType,
+  onShowConnections,
+  hasBackgroundSessions,
 }: TabBarProps) {
   const router = useRouter();
   const { isKeyboardVisible } = useKeyboard();
@@ -87,12 +120,10 @@ export default function TabBar({
     <View style={{ position: "relative" }}>
       <View
         style={{
-          backgroundColor: BACKGROUNDS.DARKER,
-          borderTopWidth: BORDERS.MAJOR,
+          backgroundColor: BACKGROUNDS.DARKEST,
+          borderTopWidth: StyleSheet.hairlineWidth,
           borderTopColor: BORDER_COLORS.PRIMARY,
-          borderBottomWidth:
-            activeSessionType === "terminal" ? BORDERS.STANDARD : 0,
-          borderBottomColor: BORDER_COLORS.PRIMARY,
+          borderBottomWidth: 0,
           height: tabBarHeight + (needsBottomPadding ? insets.bottom : 0),
           paddingBottom: needsBottomPadding ? insets.bottom : 0,
           justifyContent:
@@ -106,8 +137,35 @@ export default function TabBar({
             alignItems: "center",
             height: tabBarHeight,
             paddingHorizontal: 8,
+            marginTop: 4,
           }}
         >
+          {/* Connections panel button */}
+          <View style={{ position: "relative", marginRight: isLandscape ? 6 : 8 }}>
+            <TouchableOpacity
+              onPress={onShowConnections}
+              focusable={false}
+              className="items-center justify-center"
+              activeOpacity={0.7}
+              style={{
+                width: buttonSize,
+                height: buttonSize,
+                borderWidth: StyleSheet.hairlineWidth,
+                borderColor: BORDER_COLORS.BUTTON,
+                backgroundColor: BACKGROUNDS.BUTTON,
+                borderRadius: RADIUS.BUTTON,
+                shadowColor: "#000",
+                shadowOffset: { width: 0, height: 2 },
+                shadowOpacity: 0.1,
+                shadowRadius: 4,
+                elevation: 2,
+              }}
+            >
+              <Layers size={isLandscape ? 16 : 18} color="#ffffff" />
+            </TouchableOpacity>
+          </View>
+
+          {/* Back to hosts button */}
           <TouchableOpacity
             onPress={() => router.navigate("/hosts" as any)}
             focusable={false}
@@ -116,7 +174,7 @@ export default function TabBar({
             style={{
               width: buttonSize,
               height: buttonSize,
-              borderWidth: BORDERS.STANDARD,
+              borderWidth: StyleSheet.hairlineWidth,
               borderColor: BORDER_COLORS.BUTTON,
               backgroundColor: BACKGROUNDS.BUTTON,
               borderRadius: RADIUS.BUTTON,
@@ -159,6 +217,8 @@ export default function TabBar({
             >
               {sessions.map((session) => {
                 const isActive = session.id === activeSessionId;
+                const SessionIcon = getSessionIcon(session.type);
+                const iconColor = isActive ? ACCENT : TEXT_COLORS.SECONDARY;
 
                 return (
                   <TouchableOpacity
@@ -167,7 +227,7 @@ export default function TabBar({
                     focusable={false}
                     className="flex-row items-center"
                     style={{
-                      borderWidth: BORDERS.STANDARD,
+                      borderWidth: StyleSheet.hairlineWidth,
                       borderColor: isActive
                         ? BORDER_COLORS.ACTIVE
                         : BORDER_COLORS.BUTTON,
@@ -180,15 +240,23 @@ export default function TabBar({
                       shadowOpacity: isActive ? 0.2 : 0,
                       shadowRadius: 4,
                       elevation: isActive ? 3 : 0,
-                      minWidth: isLandscape ? 100 : 120,
+                      minWidth: isLandscape ? 90 : 110,
                       height: buttonSize,
                     }}
                   >
-                    <View className="flex-1 px-3 py-2">
+                    <View
+                      className="flex-1 flex-row items-center gap-1.5 px-2"
+                      style={{ height: buttonSize }}
+                    >
+                      <SessionIcon
+                        size={isLandscape ? 12 : 13}
+                        color={iconColor}
+                        strokeWidth={2}
+                      />
                       <Text
-                        className={`text-sm font-medium ${
-                          isActive ? "text-green-400" : "text-gray-400"
-                        }`}
+                        className="text-sm font-medium flex-1"
+                        style={{ color: iconColor }}
+                        numberOfLines={1}
                       >
                         {session.title}
                       </Text>
@@ -203,18 +271,18 @@ export default function TabBar({
                       className="items-center justify-center"
                       activeOpacity={0.7}
                       style={{
-                        width: isLandscape ? 32 : 36,
+                        width: isLandscape ? 28 : 32,
                         height: buttonSize,
-                        borderLeftWidth: BORDERS.STANDARD,
+                        borderLeftWidth: StyleSheet.hairlineWidth,
                         borderLeftColor: isActive
                           ? BORDER_COLORS.ACTIVE
                           : BORDER_COLORS.BUTTON,
                       }}
                     >
                       <X
-                        size={isLandscape ? 14 : 16}
-                        color={isActive ? "#ffffff" : "#9CA3AF"}
-                        strokeWidth={2}
+                        size={isLandscape ? 13 : 14}
+                        color={isActive ? TEXT_COLORS.PRIMARY : TEXT_COLORS.TERTIARY}
+                        strokeWidth={2.5}
                       />
                     </TouchableOpacity>
                   </TouchableOpacity>
@@ -232,7 +300,7 @@ export default function TabBar({
               style={{
                 width: buttonSize,
                 height: buttonSize,
-                borderWidth: BORDERS.STANDARD,
+                borderWidth: StyleSheet.hairlineWidth,
                 borderColor: BORDER_COLORS.BUTTON,
                 backgroundColor: BACKGROUNDS.BUTTON,
                 borderRadius: RADIUS.BUTTON,
@@ -261,20 +329,20 @@ export default function TabBar({
               style={{
                 width: buttonSize,
                 height: buttonSize,
-                borderWidth: BORDERS.STANDARD,
-                borderColor: BORDER_COLORS.BUTTON,
-                backgroundColor: BACKGROUNDS.BUTTON,
+                borderWidth: StyleSheet.hairlineWidth,
+                borderColor: isCustomKeyboardVisible
+                  ? BORDER_COLORS.ACTIVE
+                  : BORDER_COLORS.BUTTON,
+                backgroundColor: isCustomKeyboardVisible
+                  ? `${ACCENT}18`
+                  : BACKGROUNDS.BUTTON,
                 borderRadius: RADIUS.BUTTON,
-                shadowColor: "#000",
-                shadowOffset: { width: 0, height: 2 },
-                shadowOpacity: 0.1,
-                shadowRadius: 4,
                 elevation: 2,
                 marginLeft: isLandscape ? 6 : 8,
               }}
             >
               {isCustomKeyboardVisible ? (
-                <Minus size={isLandscape ? 18 : 20} color="#ffffff" />
+                <Minus size={isLandscape ? 18 : 20} color={ACCENT} />
               ) : (
                 <Plus size={isLandscape ? 18 : 20} color="#ffffff" />
               )}
@@ -282,18 +350,6 @@ export default function TabBar({
           )}
         </View>
       </View>
-      {activeSessionType === "terminal" && isCustomKeyboardVisible && (
-        <View
-          style={{
-            position: "absolute",
-            top: "100%",
-            left: 0,
-            right: 0,
-            height: 2,
-            backgroundColor: BORDER_COLORS.PRIMARY,
-          }}
-        />
-      )}
     </View>
   );
 }

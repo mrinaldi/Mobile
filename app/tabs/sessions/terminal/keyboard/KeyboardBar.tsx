@@ -1,23 +1,24 @@
 import React, { useState, useEffect } from "react";
-import { View, ScrollView, Text, Platform } from "react-native";
+import { View, ScrollView, StyleSheet, TouchableOpacity, Text } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { TerminalHandle } from "../Terminal";
 import KeyboardKey from "./KeyboardKey";
 import { useKeyboardCustomization } from "@/app/contexts/KeyboardCustomizationContext";
 import { KeyConfig } from "@/types/keyboard";
-import { useKeyboard } from "@/app/contexts/KeyboardContext";
 import { useOrientation } from "@/app/utils/orientation";
-import {
-  BORDERS,
-  BORDER_COLORS,
-  BACKGROUNDS,
-} from "@/app/constants/designTokens";
+import { BACKGROUNDS, BORDER_COLORS, ACCENT } from "@/app/constants/designTokens";
 
 interface KeyboardBarProps {
   terminalRef: React.RefObject<TerminalHandle | null>;
   isVisible: boolean;
-  onModifierChange?: (modifiers: { ctrl: boolean; alt: boolean }) => void;
+  onModifierChange?: (modifiers: {
+    ctrl: boolean;
+    alt: boolean;
+    shift: boolean;
+  }) => void;
   isKeyboardIntentionallyHidden?: boolean;
+  bottomInset?: number;
+  onOpenSnippets?: () => void;
 }
 
 export default function KeyboardBar({
@@ -25,14 +26,14 @@ export default function KeyboardBar({
   isVisible,
   onModifierChange,
   isKeyboardIntentionallyHidden = false,
+  bottomInset = 0,
+  onOpenSnippets,
 }: KeyboardBarProps) {
   const { config } = useKeyboardCustomization();
-  const { keyboardHeight, isKeyboardVisible } = useKeyboard();
   const { isLandscape } = useOrientation();
   const [ctrlPressed, setCtrlPressed] = useState(false);
   const [altPressed, setAltPressed] = useState(false);
-
-  if (!isVisible) return null;
+  const [shiftPressed, setShiftPressed] = useState(false);
 
   const sendKey = (key: string) => {
     terminalRef.current?.sendInput(key);
@@ -48,7 +49,10 @@ export default function KeyboardBar({
       case "tab":
       case "complete":
       case "comp":
-        sendKey("\t");
+        sendKey(shiftPressed ? "\x1b[Z" : "\t");
+        break;
+      case "shiftTab":
+        sendKey("\x1b[Z");
         break;
       case "arrowUp":
       case "history":
@@ -78,10 +82,10 @@ export default function KeyboardBar({
       if (clipboardContent) {
         sendKey(clipboardContent);
       }
-    } catch (error) {}
+    } catch {}
   };
 
-  const toggleModifier = (modifier: "ctrl" | "alt") => {
+  const toggleModifier = (modifier: "ctrl" | "alt" | "shift") => {
     switch (modifier) {
       case "ctrl":
         setCtrlPressed(!ctrlPressed);
@@ -89,20 +93,33 @@ export default function KeyboardBar({
       case "alt":
         setAltPressed(!altPressed);
         break;
+      case "shift":
+        setShiftPressed(!shiftPressed);
+        break;
     }
   };
 
   useEffect(() => {
     if (onModifierChange) {
-      onModifierChange({ ctrl: ctrlPressed, alt: altPressed });
+      onModifierChange({
+        ctrl: ctrlPressed,
+        alt: altPressed,
+        shift: shiftPressed,
+      });
     }
-  }, [ctrlPressed, altPressed]);
+  }, [ctrlPressed, altPressed, shiftPressed, onModifierChange]);
+
+  if (!isVisible) return null;
 
   const renderKey = (keyConfig: KeyConfig, index: number) => {
     const isModifier =
-      keyConfig.isModifier || keyConfig.id === "ctrl" || keyConfig.id === "alt";
+      keyConfig.isModifier ||
+      keyConfig.id === "ctrl" ||
+      keyConfig.id === "alt" ||
+      keyConfig.id === "shift";
     const isCtrl = keyConfig.id === "ctrl";
     const isAlt = keyConfig.id === "alt";
+    const isShift = keyConfig.id === "shift";
 
     return (
       <KeyboardKey
@@ -112,12 +129,21 @@ export default function KeyboardBar({
           if (isModifier) {
             if (isCtrl) toggleModifier("ctrl");
             else if (isAlt) toggleModifier("alt");
+            else if (isShift) toggleModifier("shift");
           } else {
             sendSpecialKey(keyConfig);
           }
         }}
         isModifier={isModifier}
-        isActive={isCtrl ? ctrlPressed : isAlt ? altPressed : false}
+        isActive={
+          isCtrl
+            ? ctrlPressed
+            : isAlt
+              ? altPressed
+              : isShift
+                ? shiftPressed
+                : false
+        }
         keySize={config.settings.keySize}
         hapticFeedback={config.settings.hapticFeedback}
       />
@@ -128,47 +154,67 @@ export default function KeyboardBar({
   const hasPinnedKeys = pinnedKeys.length > 0;
 
   return (
-    <View style={{ position: "relative", marginTop: isLandscape ? -2 : -4 }}>
-      <View
-        style={{
-          backgroundColor: BACKGROUNDS.DARKER,
-          paddingBottom: isKeyboardIntentionallyHidden ? 16 : 0,
+    <View
+      style={{
+        backgroundColor: BACKGROUNDS.DARKEST,
+        paddingBottom: isKeyboardIntentionallyHidden ? bottomInset : 0,
+        marginTop: 2,
+        borderTopWidth: StyleSheet.hairlineWidth,
+        borderTopColor: BORDER_COLORS.PRIMARY,
+      }}
+    >
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={{
+          paddingHorizontal: 8,
+          paddingVertical: isLandscape ? 6 : 8,
+          alignItems: "center",
+          gap: isLandscape ? 4 : 6,
         }}
+        keyboardShouldPersistTaps="handled"
       >
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={{
-            paddingHorizontal: 8,
-            paddingVertical: isLandscape ? 6 : 8,
-            alignItems: "center",
-            gap: isLandscape ? 4 : 6,
-          }}
-          keyboardShouldPersistTaps="handled"
-        >
-          {hasPinnedKeys && (
-            <>
-              {pinnedKeys.map((key, index) => renderKey(key, index))}
-              <View
-                className="w-px h-[30px] mx-2"
-                style={{ backgroundColor: BORDER_COLORS.SEPARATOR }}
-              />
-            </>
-          )}
+        {hasPinnedKeys && (
+          <>
+            {pinnedKeys.map((key, index) => renderKey(key, index))}
+            <View
+              className="mx-2 h-[30px] w-px"
+              style={{ backgroundColor: BORDER_COLORS.PRIMARY }}
+            />
+          </>
+        )}
 
-          {keys.map((key, index) => renderKey(key, index))}
-        </ScrollView>
-      </View>
-      <View
-        style={{
-          position: "absolute",
-          bottom: -52,
-          left: 0,
-          right: 0,
-          backgroundColor: BACKGROUNDS.DARKER,
-          height: 55,
-        }}
-      />
+        {keys.map((key, index) => renderKey(key, index))}
+
+        {onOpenSnippets && (
+          <>
+            <View
+              style={{
+                width: StyleSheet.hairlineWidth,
+                height: 30,
+                backgroundColor: BORDER_COLORS.PRIMARY,
+                marginHorizontal: 8,
+              }}
+            />
+            <TouchableOpacity
+              onPress={onOpenSnippets}
+              style={{
+                height: 32,
+                paddingHorizontal: 10,
+                alignItems: "center",
+                justifyContent: "center",
+                borderWidth: StyleSheet.hairlineWidth,
+                borderColor: BORDER_COLORS.PRIMARY,
+                backgroundColor: BACKGROUNDS.CARD,
+              }}
+            >
+              <Text style={{ fontSize: 11, fontWeight: "600", color: ACCENT, letterSpacing: 0.5 }}>
+                {"{ }"}
+              </Text>
+            </TouchableOpacity>
+          </>
+        )}
+      </ScrollView>
     </View>
   );
 }

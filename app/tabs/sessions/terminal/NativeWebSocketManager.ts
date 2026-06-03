@@ -12,6 +12,9 @@ export interface TerminalHostConfig {
   keyPassword?: string;
   keyType?: string;
   credentialId?: number;
+  jumpHosts?: { hostId: number }[];
+  forceKeyboardInteractive?: boolean;
+  overrideCredentialUsername?: boolean;
 }
 
 export type WsState =
@@ -34,6 +37,10 @@ export interface HostKeyData {
 
 export interface NativeWSConfig {
   hostConfig: TerminalHostConfig;
+  /** Stable tab instance id for cross-device session tracking (open-tabs). */
+  tabInstanceId?: string;
+  /** Backend session id to attach to on first connect (reviving a tab). */
+  initialSessionId?: string | null;
   onStateChange: (state: WsState, data?: Record<string, unknown>) => void;
   onData: (data: string) => void;
   onTotpRequired: (prompt: string, isPassword: boolean) => void;
@@ -44,9 +51,15 @@ export interface NativeWSConfig {
     scenario: "new" | "changed",
     data: HostKeyData,
   ) => void;
+  onPassphraseRequired?: () => void;
+  onWarpgateAuthRequired?: (url: string, securityKey: string) => void;
   onPostConnectionSetup: () => void;
   onDisconnected: (hostName: string) => void;
   onConnectionFailed: (message: string) => void;
+  /** Fired when the backend session id is created/attached/cleared. */
+  onSessionIdChange?: (sessionId: string | null) => void;
+  /** Fired for each `connection_log` WS message from the server. */
+  onConnectionLog?: (entry: { level?: string; stage?: string; message: string }) => void;
 }
 
 export class NativeWebSocketManager {
@@ -57,6 +70,7 @@ export class NativeWebSocketManager {
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private connectionTimeout: ReturnType<typeof setTimeout> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private pongTimeout: ReturnType<typeof setTimeout> | null = null;
   private shouldNotReconnect = false;
   private hasNotifiedFailure = false;
   private isAppInBackground = false;
@@ -69,9 +83,20 @@ export class NativeWebSocketManager {
   private wsUrl: string | null = null;
   private serverSessionId: string | null = null;
   private pendingReattach = false;
+  private awaitingAuthCredentials = false;
 
   constructor(config: NativeWSConfig) {
     this.config = config;
+    // Seed the backend session id when reviving a backgrounded/cross-device tab.
+    if (config.initialSessionId) {
+      this.serverSessionId = config.initialSessionId;
+    }
+  }
+
+  private setServerSessionId(id: string | null) {
+    if (this.serverSessionId === id) return;
+    this.serverSessionId = id;
+    this.config.onSessionIdChange?.(id);
   }
 
   async connect(cols: number, rows: number): Promise<void> {
@@ -107,6 +132,7 @@ export class NativeWebSocketManager {
   destroy(): void {
     this.destroyed = true;
     this.shouldNotReconnect = true;
+    this.awaitingAuthCredentials = false;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify({ type: "disconnect" }));
@@ -178,7 +204,7 @@ export class NativeWebSocketManager {
   ): void {
     this.cols = cols;
     this.rows = rows;
-    const updatedHostConfig = {
+    const updatedHostConfig: TerminalHostConfig = {
       ...this.config.hostConfig,
       password: credentials.password,
       key: credentials.sshKey,
@@ -187,6 +213,11 @@ export class NativeWebSocketManager {
         | "password"
         | "key",
     };
+
+    this.config.hostConfig = updatedHostConfig;
+    this.awaitingAuthCredentials = false;
+    this.shouldNotReconnect = false;
+    this.hasNotifiedFailure = false;
 
     const messageData = {
       password: credentials.password,
@@ -206,6 +237,38 @@ export class NativeWebSocketManager {
           }),
         );
       } catch (e) {}
+      return;
+    }
+
+    // Clear any pending connection timeout before starting a new connect to
+    // prevent the old timer from closing the newly-created socket.
+    this.clearAllTimers();
+    this.connectWebSocket();
+  }
+
+  sendWarpgateContinue(): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({ type: "warpgate_auth_continue", data: {} }));
+      } catch (_) {}
+    }
+  }
+
+  sendPassphraseResponse(passphrase: string): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(
+          JSON.stringify({
+            type: "reconnect_with_credentials",
+            data: {
+              keyPassword: passphrase,
+              hostConfig: { ...this.config.hostConfig, keyPassword: passphrase },
+              cols: this.cols,
+              rows: this.rows,
+            },
+          }),
+        );
+      } catch (_) {}
     }
   }
 
@@ -234,7 +297,7 @@ export class NativeWebSocketManager {
     }
 
     this.isReconnectFromBackground = true;
-    this.reconnectAttempts = 1;
+    this.reconnectAttempts = 0;
 
     if (this.ws) {
       try {
@@ -326,6 +389,7 @@ export class NativeWebSocketManager {
               sessionId: this.serverSessionId,
               cols: this.cols,
               rows: this.rows,
+              tabInstanceId: this.config.tabInstanceId,
             },
           }),
         );
@@ -337,6 +401,7 @@ export class NativeWebSocketManager {
               cols: this.cols,
               rows: this.rows,
               hostConfig: this.config.hostConfig,
+              tabInstanceId: this.config.tabInstanceId,
             },
           }),
         );
@@ -361,6 +426,8 @@ export class NativeWebSocketManager {
             false,
           );
         } else if (msg.type === "password_required") {
+          this.awaitingAuthCredentials = true;
+          this.shouldNotReconnect = true;
           this.config.onTotpRequired(
             (msg.prompt as string) || "Password:",
             true,
@@ -369,6 +436,8 @@ export class NativeWebSocketManager {
           msg.type === "keyboard_interactive_available" ||
           msg.type === "auth_method_not_available"
         ) {
+          this.awaitingAuthCredentials = true;
+          this.shouldNotReconnect = true;
           this.config.onAuthDialogNeeded("no_keyboard");
         } else if (msg.type === "host_key_verification_required") {
           if (this.connectionTimeout) {
@@ -379,6 +448,11 @@ export class NativeWebSocketManager {
             this.config.onHostKeyVerificationRequired(
               "new",
               msg.data as HostKeyData,
+            );
+          } else {
+            this.shouldNotReconnect = true;
+            this.notifyFailureOnce(
+              "Host key verification required but no handler is registered",
             );
           }
         } else if (msg.type === "host_key_changed") {
@@ -391,9 +465,39 @@ export class NativeWebSocketManager {
               "changed",
               msg.data as HostKeyData,
             );
+          } else {
+            this.shouldNotReconnect = true;
+            this.notifyFailureOnce(
+              "Host key changed but no handler is registered",
+            );
           }
+        } else if (msg.type === "passphrase_required") {
+          if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+          }
+          this.config.onPassphraseRequired?.();
+        } else if (msg.type === "warpgate_auth_required") {
+          if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+          }
+          this.config.onWarpgateAuthRequired?.(
+            (msg.url as string) || "",
+            (msg.securityKey as string) || "",
+          );
         } else if (msg.type === "error") {
           const message = (msg.message as string) || "Unknown error";
+          if (
+            this.config.hostConfig.authType === "none" &&
+            this.isAuthenticationError(message)
+          ) {
+            this.awaitingAuthCredentials = true;
+            this.shouldNotReconnect = true;
+            this.config.onAuthDialogNeeded("no_keyboard");
+            return;
+          }
+
           if (this.isUnrecoverableError(message)) {
             this.shouldNotReconnect = true;
             this.notifyFailureOnce("Authentication failed: " + message);
@@ -414,16 +518,17 @@ export class NativeWebSocketManager {
             this.config.onPostConnectionSetup();
           }
         } else if (msg.type === "disconnected") {
-          this.serverSessionId = null;
+          this.setServerSessionId(null);
           this.config.onDisconnected(this.config.hostConfig.name);
         } else if (msg.type === "pong") {
+          this.clearPongTimeout();
         } else if (msg.type === "resized") {
         } else if (msg.type === "sessionCreated") {
-          this.serverSessionId = msg.sessionId as string;
+          this.setServerSessionId(msg.sessionId as string);
         } else if (msg.type === "sessionAttached") {
-          this.serverSessionId = msg.sessionId as string;
+          this.setServerSessionId(msg.sessionId as string);
         } else if (msg.type === "sessionExpired") {
-          this.serverSessionId = null;
+          this.setServerSessionId(null);
           this.pendingReattach = false;
           if (this.ws && this.ws.readyState === WebSocket.OPEN) {
             this.ws.send(
@@ -433,17 +538,22 @@ export class NativeWebSocketManager {
                   cols: this.cols,
                   rows: this.rows,
                   hostConfig: this.config.hostConfig,
+                  tabInstanceId: this.config.tabInstanceId,
                 },
               }),
             );
           }
         } else if (msg.type === "sessionTakenOver") {
-          this.serverSessionId = null;
+          this.setServerSessionId(null);
           this.shouldNotReconnect = true;
           this.config.onDisconnected(this.config.hostConfig.name);
+        } else if (msg.type === "connection_log") {
+          if (msg.data) {
+            this.config.onConnectionLog?.(msg.data as { level?: string; stage?: string; message: string });
+          }
         }
       } catch (_) {
-        this.config.onData(event.data as string);
+        // Malformed/non-JSON frame — discard rather than printing garbage to terminal.
       }
     };
 
@@ -453,6 +563,13 @@ export class NativeWebSocketManager {
         this.connectionTimeout = null;
       }
       this.stopPingInterval();
+      this.clearPongTimeout();
+      // Only reset awaitingAuthCredentials when the connection closed without
+      // us actively waiting for user input (e.g. network drop). If shouldNotReconnect
+      // is set alongside it, we're mid-auth-dialog — leave both intact.
+      if (!this.shouldNotReconnect) {
+        this.awaitingAuthCredentials = false;
+      }
 
       if (this.isAppInBackground) {
         return;
@@ -520,6 +637,21 @@ export class NativeWebSocketManager {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         try {
           this.ws.send(JSON.stringify({ type: "ping" }));
+          // Start a pong timeout — if no pong arrives within 10s the connection
+          // is silently dead (TCP hang) and we need to force-reconnect.
+          this.clearPongTimeout();
+          this.pongTimeout = setTimeout(() => {
+            this.pongTimeout = null;
+            if (this.destroyed || this.isAppInBackground) return;
+            if (this.ws) {
+              try {
+                this.ws.onclose = null;
+                this.ws.close();
+              } catch (_) {}
+              this.ws = null;
+            }
+            this.scheduleReconnect();
+          }, 10000);
         } catch (_) {}
       }
     }, 25000);
@@ -529,6 +661,13 @@ export class NativeWebSocketManager {
     if (this.pingInterval) {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
+    }
+  }
+
+  private clearPongTimeout(): void {
+    if (this.pongTimeout) {
+      clearTimeout(this.pongTimeout);
+      this.pongTimeout = null;
     }
   }
 
@@ -542,6 +681,7 @@ export class NativeWebSocketManager {
   private clearAllTimers(): void {
     this.stopPingInterval();
     this.clearReconnectTimeout();
+    this.clearPongTimeout();
     if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout);
       this.connectionTimeout = null;
@@ -557,6 +697,10 @@ export class NativeWebSocketManager {
   }
 
   private isUnrecoverableError(message: string): boolean {
+    return this.isAuthenticationError(message);
+  }
+
+  private isAuthenticationError(message: string): boolean {
     if (!message) return false;
     const m = message.toLowerCase();
     return (

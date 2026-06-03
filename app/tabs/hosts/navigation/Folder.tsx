@@ -1,87 +1,139 @@
-import { View, Text, TouchableOpacity, Animated } from "react-native";
-import Host from "@/app/tabs/hosts/navigation/Host";
-import { ChevronDown } from "lucide-react-native";
-import { useState, useRef, useEffect } from "react";
-import { SSHHost } from "@/types";
+import { View, Pressable } from "react-native";
+import { ChevronRight, Folder as FolderIcon } from "lucide-react-native";
+import { SSHHost, HostTreeNode } from "@/types";
+import Host, { HostMetrics } from "@/app/tabs/hosts/navigation/Host";
+import { Text } from "@/app/components/ui";
+import { useThemeColor } from "@/app/contexts/ThemeContext";
+import {
+  GetHostStatus,
+  folderCounts,
+  isFolder,
+} from "@/app/tabs/hosts/navigation/hostTree";
 
-interface FolderProps {
-  name: string;
-  hosts: SSHHost[];
-  getHostStatus: (hostId: number) => "online" | "offline" | "unknown";
+interface SharedProps {
+  expandedPaths: Set<string>;
+  onToggle: (path: string) => void;
+  getHostStatus: GetHostStatus;
+  getHostMetrics?: (hostId: number) => HostMetrics | undefined;
+  showTags?: boolean;
+  onHostPress: (host: SSHHost) => void;
 }
 
-export default function Folder({ name, hosts, getHostStatus }: FolderProps) {
-  const [isExpanded, setIsExpanded] = useState(true);
-  const rotateValue = useRef(new Animated.Value(0)).current;
+/** Mutable counter so striping is continuous across the whole flattened tree. */
+type StripeCounter = { i: number };
 
-  const toggleExpanded = () => {
-    setIsExpanded(!isExpanded);
-  };
+function TreeNode({
+  node,
+  depth,
+  stripe,
+  shared,
+}: {
+  node: HostTreeNode;
+  depth: number;
+  stripe: StripeCounter;
+  shared: SharedProps;
+}) {
+  const color = useThemeColor();
+  const muted = color("muted-foreground") ?? "#9ca3af";
+  const accent = color("accent-brand") ?? "#f59145";
 
-  useEffect(() => {
-    Animated.timing(rotateValue, {
-      toValue: isExpanded ? 0 : 1,
-      duration: 200,
-      useNativeDriver: true,
-    }).start();
-  }, [isExpanded, rotateValue]);
+  if (!isFolder(node)) {
+    const striped = stripe.i++ % 2 === 1;
+    return (
+      <Host
+        host={node.host}
+        status={shared.getHostStatus(node.host.id)}
+        metrics={shared.getHostMetrics?.(node.host.id)}
+        showTags={shared.showTags}
+        striped={striped}
+        onPress={shared.onHostPress}
+      />
+    );
+  }
 
-  const rotate = rotateValue.interpolate({
-    inputRange: [0, 1],
-    outputRange: ["0deg", "180deg"],
-  });
+  const isOpen = shared.expandedPaths.has(node.path);
+  const { total, online } = folderCounts(node, shared.getHostStatus);
+  const folderStriped = stripe.i++ % 2 === 1;
 
   return (
-    <View
-      className={`mb-3 w-full h-auto border-2 border-dark-border rounded-md overflow-hidden`}
-    >
-      <View
-        className={`bg-dark-bg-header ${isExpanded ? "border-b-2 border-dark-border" : ""}`}
+    <View>
+      <Pressable
+        onPress={() => shared.onToggle(node.path)}
+        className={`flex-row items-center gap-2 px-2 py-2 active:bg-muted/40 ${
+          folderStriped ? "bg-muted/20" : ""
+        }`}
       >
-        <TouchableOpacity
-          onPress={toggleExpanded}
-          className="flex-row items-center justify-between p-3"
-          activeOpacity={0.7}
+        <View
+          style={{ transform: [{ rotate: isOpen ? "90deg" : "0deg" }] }}
+          className="shrink-0"
         >
-          <View className="flex-row items-center flex-1">
-            <Text className="text-lg font-bold text-white" numberOfLines={1}>
-              {name}
+          <ChevronRight size={13} color={color("muted-foreground", 0.6)} />
+        </View>
+        <FolderIcon
+          size={14}
+          color={node.color ?? (isOpen ? accent : muted)}
+          fill={node.color ? node.color : "transparent"}
+        />
+        <Text
+          weight="bold"
+          className="flex-1 text-[13px] text-foreground/80"
+          numberOfLines={1}
+        >
+          {node.name}
+        </Text>
+        <Text className="text-[10px]">
+          {online > 0 ? (
+            <Text className="text-[10px] text-accent-brand" weight="bold">
+              {online}
             </Text>
-            <Text className="text-sm text-gray-400 ml-3">
-              {hosts.length} host{hosts.length !== 1 ? "s" : ""}
+          ) : null}
+          <Text className="text-[10px] text-muted-foreground/40">/{total}</Text>
+        </Text>
+      </Pressable>
+
+      {isOpen ? (
+        <View className="ml-3.5 border-l border-border/40 pl-1.5">
+          {node.children.length === 0 ? (
+            <Text className="px-2 py-2 text-[11px] text-muted-foreground">
+              No hosts in this folder
             </Text>
-          </View>
-          <View className="bg-dark-bg-button rounded-md border-2 border-dark-border w-[30px] h-[30px] items-center justify-center ml-2">
-            <Animated.View style={{ transform: [{ rotate }] }}>
-              <ChevronDown size={16} color="white" />
-            </Animated.View>
-          </View>
-        </TouchableOpacity>
-      </View>
-      {isExpanded && (
-        <View className="bg-dark-bg p-3">
-          {hosts.length === 0 ? (
-            <View className="py-4 px-4">
-              <Text className="text-white text-center">
-                No hosts in this folder
-              </Text>
-            </View>
           ) : (
-            hosts.map((host, index) => (
-              <View
-                key={host.id}
-                className={`${index < hosts.length - 1 ? "mb-2" : ""}`}
-              >
-                <Host
-                  host={host}
-                  status={getHostStatus(host.id)}
-                  isLast={index === hosts.length - 1}
-                />
-              </View>
+            node.children.map((child) => (
+              <TreeNode
+                key={isFolder(child) ? `f:${child.path}` : `h:${child.host.id}`}
+                node={child}
+                depth={depth + 1}
+                stripe={stripe}
+                shared={shared}
+              />
             ))
           )}
         </View>
-      )}
+      ) : null}
+    </View>
+  );
+}
+
+/**
+ * Renders a list of host-tree nodes (folders nest recursively, hosts are
+ * leaves). Expansion state is controlled by the parent so it can be persisted.
+ */
+export default function HostTree({
+  nodes,
+  ...shared
+}: { nodes: HostTreeNode[] } & SharedProps) {
+  const stripe: StripeCounter = { i: 0 };
+  return (
+    <View className="gap-1.5">
+      {nodes.map((node) => (
+        <TreeNode
+          key={isFolder(node) ? `f:${node.path}` : `h:${node.host.id}`}
+          node={node}
+          depth={0}
+          stripe={stripe}
+          shared={shared}
+        />
+      ))}
     </View>
   );
 }

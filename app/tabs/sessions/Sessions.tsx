@@ -1,25 +1,23 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   View,
-  Text,
-  ScrollView,
-  TouchableOpacity,
-  StyleSheet,
   Keyboard,
-  KeyboardAvoidingView,
   Platform,
   TextInput,
-  TouchableWithoutFeedback,
-  Pressable,
   Dimensions,
   BackHandler,
   AppState,
   LayoutAnimation,
+  Pressable,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFocusEffect } from "@react-navigation/native";
 import { useRouter } from "expo-router";
-import { useTerminalSessions } from "@/app/contexts/TerminalSessionsContext";
+import {
+  SessionType,
+  useTerminalSessions,
+} from "@/app/contexts/TerminalSessionsContext";
+import { X } from "lucide-react-native";
 import { useKeyboard } from "@/app/contexts/KeyboardContext";
 import {
   Terminal,
@@ -37,18 +35,24 @@ import {
   TunnelManager,
   TunnelManagerHandle,
 } from "@/app/tabs/sessions/tunnel/TunnelManager";
+import { RemoteDesktop } from "@/app/tabs/sessions/remote-desktop/RemoteDesktop";
+import { Docker } from "@/app/tabs/sessions/docker/Docker";
+import { ConnectionsPanel } from "@/app/tabs/sessions/ConnectionsPanel";
+import { Screen } from "@/app/components/Screen";
+import { Text } from "@/app/components/ui";
 import TabBar from "@/app/tabs/sessions/navigation/TabBar";
 import BottomToolbar from "@/app/tabs/sessions/terminal/keyboard/BottomToolbar";
 import KeyboardBar from "@/app/tabs/sessions/terminal/keyboard/KeyboardBar";
-import { ArrowLeft } from "lucide-react-native";
 import { useOrientation } from "@/app/utils/orientation";
 import { getMaxKeyboardHeight, getTabBarHeight } from "@/app/utils/responsive";
-import {
-  BACKGROUNDS,
-  BORDER_COLORS,
-  BORDERS,
-} from "@/app/constants/designTokens";
+import { BACKGROUNDS, BORDER_COLORS, RADIUS } from "@/app/constants/designTokens";
 import { addKeyCommandListener } from "@/modules/hardware-keyboard";
+
+type ActiveModifiers = {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+};
 
 export default function Sessions() {
   const insets = useSafeAreaInsets();
@@ -58,8 +62,10 @@ export default function Sessions() {
   const {
     sessions,
     activeSessionId,
+    backgroundTabRecords,
     setActiveSession,
     removeSession,
+    setBackendSessionId,
     isCustomKeyboardVisible,
     toggleCustomKeyboard,
     lastKeyboardHeight,
@@ -67,6 +73,8 @@ export default function Sessions() {
     keyboardIntentionallyHiddenRef,
     setKeyboardIntentionallyHidden,
   } = useTerminalSessions();
+
+  const [showConnectionsPanel, setShowConnectionsPanel] = useState(false);
   const { keyboardHeight, isKeyboardVisible } = useKeyboard();
   const hiddenInputRef = useRef<TextInput>(null);
   const terminalRefs = useRef<Record<string, React.RefObject<TerminalHandle>>>(
@@ -84,21 +92,31 @@ export default function Sessions() {
   const [activeModifiers, setActiveModifiers] = useState({
     ctrl: false,
     alt: false,
+    shift: false,
   });
   const [screenDimensions, setScreenDimensions] = useState(
     Dimensions.get("window"),
   );
   const [keyboardType, setKeyboardType] = useState<any>("default");
+  const [customKeyboardInitialTab, setCustomKeyboardInitialTab] = useState<"keyboard" | "snippets" | "history">("keyboard");
   const [hiddenInputValue, setHiddenInputValue] = useState("");
   const dictationBufferRef = useRef("");
   const dictationSentRef = useRef("");
   const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
+  const ignoreNextTextChangeRef = useRef(false);
+
+  const resetHiddenInputState = useCallback(() => {
     if (dictationTimerRef.current) clearTimeout(dictationTimerRef.current);
+    dictationTimerRef.current = null;
     dictationBufferRef.current = "";
     dictationSentRef.current = "";
     setHiddenInputValue("");
-  }, [activeSessionId]);
+  }, []);
+
+  useEffect(() => {
+    resetHiddenInputState();
+    ignoreNextTextChangeRef.current = false;
+  }, [activeSessionId, resetHiddenInputState]);
   const lastBlurTimeRef = useRef<number>(0);
   const [terminalBackgroundColors, setTerminalBackgroundColors] = useState<
     Record<string, string>
@@ -123,7 +141,27 @@ export default function Sessions() {
   const CUSTOM_KEYBOARD_TAB_HEIGHT = 36;
 
   const KEYBOARD_BAR_HEIGHT = isLandscape ? 48 : 52;
-  const KEYBOARD_BAR_HEIGHT_EXTENDED = isLandscape ? 64 : 68;
+  // When the system keyboard is dismissed the keyboard bar reserves the
+  // home-indicator safe area below its keys. The TabBar floats directly on top
+  // of the bar, so it must be lifted by the keys' height PLUS that same
+  // reservation — otherwise the reserved space falls between the TabBar and the
+  // keys and the TabBar looks bottom-heavy. Keep these two in lockstep.
+  const KEYBOARD_BAR_BOTTOM_INSET = Math.max(insets.bottom, 8);
+  const KEYBOARD_BAR_HEIGHT_EXTENDED =
+    KEYBOARD_BAR_HEIGHT + KEYBOARD_BAR_BOTTOM_INSET;
+
+  const activeSession = sessions.find(
+    (session) => session.id === activeSessionId,
+  );
+
+  const [isRdpKeyboardOpen, setIsRdpKeyboardOpen] = useState(false);
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardDidShow", () => {
+      if (activeSession?.type === "remoteDesktop") setIsRdpKeyboardOpen(true);
+    });
+    const hide = Keyboard.addListener("keyboardDidHide", () => setIsRdpKeyboardOpen(false));
+    return () => { show.remove(); hide.remove(); };
+  }, [activeSession?.type]);
 
   const getTabBarBottomPosition = () => {
     if (activeSession?.type !== "terminal") {
@@ -145,9 +183,7 @@ export default function Sessions() {
     return KEYBOARD_BAR_HEIGHT;
   };
 
-  const getBottomMargin = (
-    sessionType: "terminal" | "stats" | "filemanager" = "terminal",
-  ) => {
+  const getBottomMargin = (sessionType: SessionType = "terminal") => {
     if (sessionType !== "terminal") {
       return SESSION_TAB_BAR_HEIGHT + insets.bottom;
     }
@@ -287,6 +323,10 @@ export default function Sessions() {
       const backHandler = BackHandler.addEventListener(
         "hardwareBackPress",
         () => {
+          if (showConnectionsPanel) {
+            setShowConnectionsPanel(false);
+            return true;
+          }
           if (isKeyboardVisible) {
             setKeyboardIntentionallyHidden(true);
             Keyboard.dismiss();
@@ -300,7 +340,7 @@ export default function Sessions() {
         backHandler.remove();
       };
     }
-  }, [sessions.length, isKeyboardVisible]);
+  }, [sessions.length, isKeyboardVisible, showConnectionsPanel]);
 
   useEffect(() => {
     const subscription = Dimensions.addEventListener("change", ({ window }) => {
@@ -395,8 +435,8 @@ export default function Sessions() {
         : null;
       if (!activeRef?.current) return;
 
-      if (event.shift && event.input === "\t") {
-        activeRef.current.sendInput("\x1b[Z");
+      if (event.input === "\t") {
+        activeRef.current.sendInput(event.shift ? "\x1b[Z" : "\t");
         return;
       }
 
@@ -407,13 +447,51 @@ export default function Sessions() {
         return;
       }
 
+      if (event.alt && !event.ctrl && event.input.length === 1) {
+        activeRef.current.sendInput(`\x1b${event.shift ? event.input.toUpperCase() : event.input}`);
+        return;
+      }
+
       const specialMap: Record<string, string> = {
         ArrowUp: "\x1b[A",
         ArrowDown: "\x1b[B",
         ArrowLeft: "\x1b[D",
         ArrowRight: "\x1b[C",
         Escape: "\x1b",
+        Backspace: "\x7f",
+        Delete: "\x1b[3~",
+        Home: "\x1b[H",
+        End: "\x1b[F",
+        PageUp: "\x1b[5~",
+        PageDown: "\x1b[6~",
+        F1: "\x1bOP",
+        F2: "\x1bOQ",
+        F3: "\x1bOR",
+        F4: "\x1bOS",
+        F5: "\x1b[15~",
+        F6: "\x1b[17~",
+        F7: "\x1b[18~",
+        F8: "\x1b[19~",
+        F9: "\x1b[20~",
+        F10: "\x1b[21~",
+        F11: "\x1b[23~",
+        F12: "\x1b[24~",
       };
+
+      // Shift+Arrow: send xterm modifier sequences
+      if (event.shift) {
+        const shiftArrowMap: Record<string, string> = {
+          ArrowUp: "\x1b[1;2A",
+          ArrowDown: "\x1b[1;2B",
+          ArrowRight: "\x1b[1;2C",
+          ArrowLeft: "\x1b[1;2D",
+        };
+        if (shiftArrowMap[event.input]) {
+          activeRef.current.sendInput(shiftArrowMap[event.input]);
+          return;
+        }
+      }
+
       if (specialMap[event.input]) {
         activeRef.current.sendInput(specialMap[event.input]);
         return;
@@ -472,6 +550,14 @@ export default function Sessions() {
     }, 100);
   };
 
+  const closeConnectionsPanel = useCallback(() => {
+    setShowConnectionsPanel(false);
+    if (activeSession?.type === "terminal" && !isCustomKeyboardVisible) {
+      setKeyboardIntentionallyHidden(false);
+      setTimeout(() => hiddenInputRef.current?.focus(), 100);
+    }
+  }, [activeSession?.type, isCustomKeyboardVisible, setKeyboardIntentionallyHidden]);
+
   const handleAddSession = () => {
     router.navigate("/hosts" as any);
   };
@@ -480,6 +566,7 @@ export default function Sessions() {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 
     if (isCustomKeyboardVisible) {
+      setCustomKeyboardInitialTab("keyboard");
       toggleCustomKeyboard();
       setKeyboardIntentionallyHidden(false);
       setTimeout(() => {
@@ -516,16 +603,26 @@ export default function Sessions() {
     }
   };
 
-  const handleModifierChange = useCallback(
-    (modifiers: { ctrl: boolean; alt: boolean }) => {
-      setActiveModifiers(modifiers);
-    },
-    [],
-  );
+  const handleOpenSnippets = useCallback(() => {
+    setCustomKeyboardInitialTab("snippets");
+    if (!isCustomKeyboardVisible) {
+      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+      toggleCustomKeyboard();
+      setKeyboardIntentionallyHidden(false);
+      requestAnimationFrame(() => { hiddenInputRef.current?.blur(); });
+      setTimeout(() => {
+        const activeRef = activeSessionId ? terminalRefs.current[activeSessionId] : null;
+        if (activeRef?.current) {
+          activeRef.current.fit();
+          setTimeout(() => activeRef.current?.scrollToBottom(), 50);
+        }
+      }, 300);
+    }
+  }, [isCustomKeyboardVisible, toggleCustomKeyboard, setKeyboardIntentionallyHidden, activeSessionId]);
 
-  const activeSession = sessions.find(
-    (session) => session.id === activeSessionId,
-  );
+  const handleModifierChange = useCallback((modifiers: ActiveModifiers) => {
+    setActiveModifiers(modifiers);
+  }, []);
 
   const activeTerminalBgColor =
     activeSession?.type === "terminal" && activeSessionId
@@ -540,9 +637,7 @@ export default function Sessions() {
         backgroundColor:
           activeSession?.type === "terminal"
             ? activeTerminalBgColor
-            : activeSession?.type === "filemanager"
-              ? BACKGROUNDS.HEADER
-              : "#18181b",
+            : BACKGROUNDS.DARK,
       }}
     >
       <View
@@ -571,10 +666,20 @@ export default function Sessions() {
                   credentialId: session.host.credentialId
                     ? parseInt(session.host.credentialId.toString())
                     : undefined,
+                  jumpHosts: session.host.jumpHosts,
+                  forceKeyboardInteractive:
+                    session.host.forceKeyboardInteractive,
+                  overrideCredentialUsername:
+                    session.host.overrideCredentialUsername,
                   terminalConfig: session.host.terminalConfig,
                 }}
                 isVisible={session.id === activeSessionId}
                 title={session.title}
+                tabInstanceId={session.instanceId}
+                initialSessionId={session.restoredSessionId}
+                onSessionIdChange={(backendId) =>
+                  setBackendSessionId(session.id, backendId)
+                }
                 onClose={() => handleTabClose(session.id)}
                 onBackgroundColorChange={(color) => {
                   setTerminalBackgroundColors((prev) => ({
@@ -592,6 +697,7 @@ export default function Sessions() {
                 hostConfig={{
                   id: parseInt(session.host.id.toString()),
                   name: session.host.name,
+                  statsConfig: session.host.statsConfig,
                   quickActions: session.host.quickActions,
                 }}
                 isVisible={session.id === activeSessionId}
@@ -625,95 +731,87 @@ export default function Sessions() {
                 onClose={() => handleTabClose(session.id)}
               />
             );
+          } else if (session.type === "remoteDesktop") {
+            return (
+              <RemoteDesktop
+                key={session.id}
+                host={session.host}
+                isVisible={session.id === activeSessionId}
+                title={session.title}
+                onClose={() => handleTabClose(session.id)}
+              />
+            );
+          } else if (session.type === "docker") {
+            return (
+              <Docker
+                key={session.id}
+                host={session.host}
+                isVisible={session.id === activeSessionId}
+              />
+            );
           }
           return null;
         })}
       </View>
 
-      {sessions.length === 0 && (
+      {/* Connections panel: full screen when no sessions, overlay when sessions exist */}
+      {(sessions.length === 0 || showConnectionsPanel) && (
         <View
           style={{
             position: "absolute",
-            top: insets.top,
+            top: 0,
             left: 0,
             right: 0,
-            bottom: 115,
-            justifyContent: "center",
-            alignItems: "center",
-            paddingHorizontal: 24,
-            pointerEvents: "box-none",
-            zIndex: 1005,
+            bottom: 0,
+            zIndex: 1010,
           }}
         >
-          <View
-            style={{
-              backgroundColor: BACKGROUNDS.CARD,
-              borderRadius: 12,
-              padding: 32,
-              alignItems: "center",
-              borderWidth: 1,
-              borderColor: BORDER_COLORS.PRIMARY,
-              minWidth: 280,
-              maxWidth: 400,
-              shadowColor: "#000",
-              shadowOffset: { width: 0, height: 4 },
-              shadowOpacity: 0.3,
-              shadowRadius: 12,
-              elevation: 8,
-              pointerEvents: "box-none",
-            }}
-          >
-            <Text
-              style={{
-                color: "#ffffff",
-                fontSize: 20,
-                fontWeight: "600",
-                marginBottom: 12,
-                textAlign: "center",
-              }}
-            >
-              No Active Terminal Sessions
-            </Text>
-            <Text
-              style={{
-                color: "#9CA3AF",
-                fontSize: 14,
-                lineHeight: 20,
-                textAlign: "center",
-                marginBottom: 20,
-              }}
-            >
-              Connect to a host from the Hosts tab to start a session
-            </Text>
-            <View
-              style={{
-                backgroundColor: "#22C55E",
-                paddingHorizontal: 32,
-                paddingVertical: 16,
-                borderRadius: 8,
-                borderWidth: 1,
-                borderColor: "#16A34A",
-                minHeight: 48,
-                minWidth: 120,
-                justifyContent: "center",
-                alignItems: "center",
-                zIndex: 1004,
-              }}
-              onTouchEnd={() => {
-                handleAddSession();
-              }}
-            >
-              <Text
+          {sessions.length === 0 ? (
+            <Screen title="Connections">
+              <ConnectionsPanel />
+            </Screen>
+          ) : (
+            <View style={{ flex: 1, backgroundColor: BACKGROUNDS.DARKEST }}>
+              <View
                 style={{
-                  color: "#ffffff",
-                  fontSize: 14,
-                  fontWeight: "600",
+                  flexDirection: "row",
+                  alignItems: "center",
+                  paddingTop: insets.top + 8,
+                  paddingBottom: 8,
+                  paddingHorizontal: 16,
+                  borderBottomWidth: 1,
+                  borderBottomColor: "rgba(255,255,255,0.08)",
+                  backgroundColor: BACKGROUNDS.DARKEST,
                 }}
               >
-                Go to Hosts
-              </Text>
+                <View style={{ flex: 1 }}>
+                  <Text
+                    weight="bold"
+                    className="text-base text-foreground"
+                  >
+                    Connections
+                  </Text>
+                </View>
+                <Pressable
+                  onPress={closeConnectionsPanel}
+                  hitSlop={10}
+                  style={{
+                    width: 32,
+                    height: 32,
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: RADIUS.BUTTON,
+                    borderWidth: 1,
+                    borderColor: BORDER_COLORS.BUTTON,
+                    backgroundColor: BACKGROUNDS.BUTTON,
+                  }}
+                >
+                  <X size={15} color="#ffffff" />
+                </Pressable>
+              </View>
+              <ConnectionsPanel onClose={closeConnectionsPanel} />
             </View>
-          </View>
+          )}
         </View>
       )}
 
@@ -749,6 +847,8 @@ export default function Sessions() {
               isKeyboardIntentionallyHidden={
                 keyboardIntentionallyHiddenRef.current
               }
+              bottomInset={KEYBOARD_BAR_BOTTOM_INSET}
+              onOpenSnippets={handleOpenSnippets}
             />
           </View>
         )}
@@ -778,6 +878,7 @@ export default function Sessions() {
           right: 0,
           height: SESSION_TAB_BAR_HEIGHT,
           zIndex: 1004,
+          display: isRdpKeyboardOpen ? "none" : "flex",
         }}
       >
         <TabBar
@@ -793,6 +894,15 @@ export default function Sessions() {
           onShowKeyboard={() => setKeyboardIntentionallyHidden(false)}
           keyboardIntentionallyHiddenRef={keyboardIntentionallyHiddenRef}
           activeSessionType={activeSession?.type}
+          onShowConnections={() => {
+            setKeyboardIntentionallyHidden(true);
+            Keyboard.dismiss();
+            hiddenInputRef.current?.blur();
+            setShowConnectionsPanel(true);
+          }}
+          hasBackgroundSessions={backgroundTabRecords.some(
+            (r) => !sessions.find((s) => s.instanceId === r.id),
+          )}
         />
       </View>
 
@@ -821,6 +931,7 @@ export default function Sessions() {
               isKeyboardIntentionallyHidden={
                 keyboardIntentionallyHiddenRef.current
               }
+              initialTab={customKeyboardInitialTab}
             />
           </View>
         )}
@@ -859,6 +970,38 @@ export default function Sessions() {
             underlineColorAndroid="transparent"
             value={hiddenInputValue}
             onChangeText={(text) => {
+              if (Platform.OS === "ios") {
+                if (ignoreNextTextChangeRef.current) {
+                  ignoreNextTextChangeRef.current = false;
+                  return;
+                }
+
+                const activeRef = activeSessionId
+                  ? terminalRefs.current[activeSessionId]
+                  : null;
+
+                if (!activeRef?.current || !text) {
+                  dictationBufferRef.current = "";
+                  dictationSentRef.current = "";
+                  setHiddenInputValue("");
+                  return;
+                }
+
+                const alreadySent = dictationSentRef.current;
+                const newText = text.startsWith(alreadySent)
+                  ? text.slice(alreadySent.length)
+                  : text;
+
+                dictationBufferRef.current = "";
+                dictationSentRef.current = text;
+                setHiddenInputValue("");
+                if (newText) activeRef.current.sendInput(newText);
+                requestAnimationFrame(() => {
+                  dictationSentRef.current = "";
+                });
+                return;
+              }
+
               if (text.length <= dictationSentRef.current.length) {
                 const hasPendingBuffer =
                   Platform.OS === "android" &&
@@ -926,7 +1069,7 @@ export default function Sessions() {
                   dictationSentRef.current = finalText;
                   if (finalText) activeRef.current?.sendInput(finalText);
                 }
-              }, 300);
+              }, 30);
             }}
             onSubmitEditing={() => {
               const activeRef = activeSessionId
@@ -952,7 +1095,7 @@ export default function Sessions() {
                   finalKey = "\x7f";
                   break;
                 case "Tab":
-                  finalKey = "\t";
+                  finalKey = activeModifiers.shift ? "\x1b[Z" : "\t";
                   break;
                 case "Escape":
                   finalKey = "\x1b";
@@ -1025,15 +1168,36 @@ export default function Sessions() {
                     if (activeModifiers.ctrl) {
                       finalKey = String.fromCharCode(key.charCodeAt(0) & 0x1f);
                     } else if (activeModifiers.alt) {
-                      finalKey = `\x1b${key}`;
+                      finalKey = `\x1b${activeModifiers.shift ? key.toUpperCase() : key}`;
+                    } else if (Platform.OS === "ios") {
+                      // On iOS, onChangeText handles bare printable chars to
+                      // support dictation/IME composition. Skip here to avoid
+                      // double-sending.
+                      return;
                     } else {
-                      finalKey = key;
-                      dictationSentRef.current = hiddenInputValue + key;
+                      finalKey = activeModifiers.shift
+                        ? key.toUpperCase()
+                        : key;
+                      dictationSentRef.current = hiddenInputValue + finalKey;
                     }
                   }
               }
 
               if (finalKey !== null) {
+                // Only reset + suppress the next onChangeText for keys that
+                // actually mutate the hidden input value (backspace, enter,
+                // tab, escape). Delete/arrows/F-keys don't change it and
+                // should not eat the next typed character.
+                const resetsInput = ["Backspace", "Enter", "Tab", "Escape"].includes(key);
+                if (resetsInput) {
+                  resetHiddenInputState();
+                  ignoreNextTextChangeRef.current = true;
+                  if (Platform.OS === "android") {
+                    requestAnimationFrame(() => {
+                      hiddenInputRef.current?.focus();
+                    });
+                  }
+                }
                 activeRef.current.sendInput(finalKey);
               }
             }}
