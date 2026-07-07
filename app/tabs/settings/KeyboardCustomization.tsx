@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { View, ScrollView, Pressable } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -10,11 +10,19 @@ import {
   SlidersHorizontal,
 } from "lucide-react-native";
 import { useKeyboardCustomization } from "@/app/contexts/KeyboardCustomizationContext";
-import { PRESET_DEFINITIONS } from "@/app/tabs/sessions/terminal/keyboard/KeyDefinitions";
+import { ALL_KEYS, PRESET_DEFINITIONS } from "@/app/tabs/sessions/terminal/keyboard/KeyDefinitions";
 import { PresetType, KeyConfig } from "@/types/keyboard";
 import { toast } from "@/app/utils/toast";
-import { Text, Button, Label, FakeSwitch, Dialog } from "@/app/components/ui";
+import { Text, Button, Label, FakeSwitch, Dialog, Input } from "@/app/components/ui";
+import { AccordionSection } from "@/app/components/ui/Accordion";
 import { useThemeColor } from "@/app/contexts/ThemeContext";
+import {
+  DEFAULT_KEY_REPEAT_INTERVAL,
+  DEFAULT_KEY_REPEAT_INITIAL_DELAY,
+  HW_REPEAT_INTERVAL,
+  TOUCH_INITIAL_DELAY,
+  REPEATABLE_KEY_IDS,
+} from "@/constants/keyboard-repeat-config";
 import KeySelector from "./components/KeySelector";
 import UnifiedDraggableList, {
   UnifiedListItem,
@@ -78,6 +86,19 @@ export default function KeyboardCustomization() {
 
   const [activeTab, setActiveTab] = useState<TabType>("presets");
   const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  // Controlled text state for repeat interval and initial delay inputs
+  const [repeatIntervalText, setRepeatIntervalText] = useState(String(config.settings.keyRepeatDelay));
+  const [initialDelayText, setInitialDelayText] = useState(String(config.settings.keyRepeatInitialDelay));
+  const [repeatIntervalError, setRepeatIntervalError] = useState<string | null>(null);
+  const [initialDelayError, setInitialDelayError] = useState<string | null>(null);
+
+  // Sync local text state when config changes externally (e.g. reset to defaults)
+  useEffect(() => {
+    setRepeatIntervalText(String(config.settings.keyRepeatDelay));
+    setInitialDelayText(String(config.settings.keyRepeatInitialDelay));
+  }, [config.settings.keyRepeatDelay, config.settings.keyRepeatInitialDelay]);
+
   const [resetType, setResetType] = useState<"all" | "topbar" | "fullkeyboard">(
     "all",
   );
@@ -565,6 +586,105 @@ export default function KeyboardCustomization() {
               onChange={(v) => updateSettings({ showHints: v })}
             />
           </View>
+
+        </View>
+      </View>
+
+      {/* Repeatable Keys — Repeat Interval */}
+      <View className="border border-border bg-card">
+        <View className="border-b border-border px-3 py-3">
+          <Label>Repeat Interval</Label>
+          <Text className="mt-1 text-[10px] text-muted-foreground">
+            Milliseconds between repeated keystrokes (lower = faster)
+          </Text>
+        </View>
+        <View className="px-3 py-3">
+          <Input
+            keyboardType="numeric"
+            placeholder="100"
+            value={repeatIntervalText}
+            onChangeText={(t) => {
+              setRepeatIntervalText(t);
+              setRepeatIntervalError(
+                t.length > 0 && isNaN(parseInt(t, 10)) ? "Enter a valid number" : null,
+              );
+            }}
+            onEndEditing={(e) => {
+              const val = parseInt(e.nativeEvent.text, 10);
+              if (isNaN(val) || val <= 0) {
+                setRepeatIntervalError("Must be greater than 0");
+                return;
+              }
+              updateSettings({ keyRepeatDelay: val });
+              setRepeatIntervalText(String(val));
+              setRepeatIntervalError(null);
+            }}
+          />
+          {repeatIntervalError && (
+            <Text className="mt-1 text-[10px] text-red-500">{repeatIntervalError}</Text>
+          )}
+          <Text className="mt-2 text-[10px] text-muted-foreground">
+            Suggested: {HW_REPEAT_INTERVAL}ms (hardware keyboard), {DEFAULT_KEY_REPEAT_INTERVAL}ms (touch devices)
+          </Text>
+        </View>
+      </View>
+
+      {/* Which keys repeat */}
+      <AccordionSection label="Repeatable Keys">
+        <View className="gap-1 pt-1">
+          {Array.from(REPEATABLE_KEY_IDS).map((id) => {
+            const keyConfig = ALL_KEYS[id];
+            if (!keyConfig) return null;
+            return (
+              <View key={id} className="flex-row items-center gap-2 py-0.5">
+                <Text className="w-10 text-center text-sm text-foreground">
+                  {keyConfig.label}
+                </Text>
+                <Text className="text-[11px] text-muted-foreground">
+                  {keyConfig.description ?? id}
+                </Text>
+              </View>
+            );
+          })}
+        </View>
+      </AccordionSection>
+
+      {/* Repeatable Keys — Initial Delay */}
+      <View className="border border-border bg-card">
+        <View className="border-b border-border px-3 py-3">
+          <Label>Initial Delay</Label>
+          <Text className="mt-1 text-[10px] text-muted-foreground">
+            Milliseconds before repeat starts (gives time to release key)
+          </Text>
+        </View>
+        <View className="px-3 py-3">
+          <Input
+            keyboardType="numeric"
+            placeholder="250"
+            value={initialDelayText}
+            onChangeText={(t) => {
+              setInitialDelayText(t);
+              setInitialDelayError(
+                t.length > 0 && isNaN(parseInt(t, 10)) ? "Enter a valid number" : null,
+              );
+            }}
+            onEndEditing={(e) => {
+              const val = parseInt(e.nativeEvent.text, 10);
+              if (isNaN(val) || val <= 0) {
+                setInitialDelayError("Must be greater than 0");
+                return;
+              }
+              updateSettings({ keyRepeatInitialDelay: val });
+              setInitialDelayText(String(val));
+              setInitialDelayError(null);
+            }}
+          />
+          {initialDelayError && (
+            <Text className="mt-1 text-[10px] text-red-500">{initialDelayError}</Text>
+          )}
+          <Text className="mt-2 text-[10px] text-muted-foreground">
+            Suggested: {DEFAULT_KEY_REPEAT_INITIAL_DELAY}ms, {TOUCH_INITIAL_DELAY}ms for touch devices
+          </Text>
         </View>
       </View>
 

@@ -7,6 +7,7 @@ import { useKeyboardCustomization } from "@/app/contexts/KeyboardCustomizationCo
 import { KeyConfig } from "@/types/keyboard";
 import { useOrientation } from "@/app/utils/orientation";
 import { BACKGROUNDS, BORDER_COLORS, ACCENT } from "@/app/constants/designTokens";
+import { isRepeatableKey } from "@/constants/keyboard-repeat-config";
 
 interface KeyboardBarProps {
   terminalRef: React.RefObject<TerminalHandle | null>;
@@ -146,6 +147,9 @@ export default function KeyboardBar({
         }
         keySize={config.settings.keySize}
         hapticFeedback={config.settings.hapticFeedback}
+        keyRepeatEnabled={isRepeatableKey(keyConfig.id)}
+        keyRepeatDelay={config.settings.keyRepeatDelay}
+        keyRepeatInitialDelay={config.settings.keyRepeatInitialDelay}
       />
     );
   };

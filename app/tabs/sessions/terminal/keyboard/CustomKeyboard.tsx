@@ -6,6 +6,7 @@ import KeyboardKey from "./KeyboardKey";
 import { useKeyboardCustomization } from "@/app/contexts/KeyboardCustomizationContext";
 import { KeyConfig } from "@/types/keyboard";
 import { BACKGROUNDS, BORDER_COLORS, TEXT_COLORS } from "@/app/constants/designTokens";
+import { isRepeatableKey } from "@/constants/keyboard-repeat-config";
 
 interface CustomKeyboardProps {
   terminalRef: React.RefObject<TerminalHandle | null>;
@@ -181,6 +182,9 @@ export default function CustomKeyboard({
                   isActive={key.id === "shift" && shiftPressed}
                   keySize={config.settings.keySize}
                   hapticFeedback={config.settings.hapticFeedback}
+                  keyRepeatEnabled={isRepeatableKey(key.id)}
+                  keyRepeatDelay={config.settings.keyRepeatDelay}
+                  keyRepeatInitialDelay={config.settings.keyRepeatInitialDelay}
                 />
               ))}
             </View>
