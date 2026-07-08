@@ -24,7 +24,7 @@ on:
 jobs:
   build:
     name: build-${{ matrix.platform }}
-    runs-on: ${{ matrix.platform == 'apple' && 'macos-latest' || 'ubuntu-2404' }}
+    runs-on: ${{ matrix.platform == 'apple' && 'macos-latest' || 'ubuntu-latest' }}
     strategy:
       matrix:
         platform: ${{ github.event.inputs.platform == 'both' && fromJSON('["apple", "android"]') || fromJSON(format('["{0}"]', github.event.inputs.platform)) }}
