@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "Termix",
-    "slug": "termix",
+    "name": "termix-mobile",
+    "slug": "termix-mobile",
     "version": "1.4.0",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
@@ -86,12 +86,12 @@
         "origin": false
       },
       "eas": {
-        "projectId": "cf86f530-ca4b-44bf-bb68-4d178b264910"
+        "projectId": "867fc5e9-efe8-4f02-a75d-9146c017a04e"
       }
     },
     "assetBundlePatterns": [
       "assets/**/*"
     ],
-    "owner": "termix"
+    "owner": "marciorinaldi"
   }
 }
